@@ -97,11 +97,13 @@ const { Gate } = await import('../gate.js');
 const { usd } = await import('../price.js');
 const { gateDefaults } = await import('../pricing.js');
 const { createMemoryReplayStore } = await import('../replay-store.js');
+const { createSharedReplayStore } = await import('./test-replay-store.js');
 
 async function setup() {
     const config = await configure({
         mpp: { challengeBindingSecret: 'x402-adapter-secret' },
         network: 'solana_localnet',
+        replayStore: createSharedReplayStore(),
     });
     return { adapter: createX402ExactAdapter(config), config };
 }
@@ -114,6 +116,7 @@ async function gateFor(amount = usd('0.10')) {
     const config = await configure({
         mpp: { challengeBindingSecret: 'x402-adapter-secret' },
         network: 'solana_localnet',
+        replayStore: createSharedReplayStore(),
     });
     return Gate.create({ amount, name: 'report' }, gateDefaults(config));
 }
@@ -486,6 +489,7 @@ describe('createX402ExactAdapter', () => {
         return {
             calls,
             store: {
+                isShared: true,
                 get: (key: string) => Promise.resolve(map.get(key) ?? null),
                 put: (key: string, value: unknown) => {
                     map.set(key, value);
@@ -559,7 +563,7 @@ describe('createX402ExactAdapter', () => {
     });
 
     it('rejects replay across independent adapters sharing the atomic memory store', async () => {
-        const shared = createMemoryReplayStore();
+        const shared = { ...createMemoryReplayStore(), isShared: true as const };
         const [{ adapter: replicaA }, { adapter: replicaB }] = await Promise.all([
             setupWithStore(shared),
             setupWithStore(shared),

@@ -37,7 +37,7 @@ import { Signer } from '../signer.js';
 const SELLER = 'AyNAa2VPe2t5pgg8M61iE6kqMudkV98zsT4rkAZuU6tj';
 const PULLER = 'CXG3Pq3DwZb1HVckhPQbVxiwoNGM3jNGYvC2BSdkj1pK';
 
-function sharedStore(): ReplayStore {
+function sharedStore(): ReplayStore & { reserve(key: string, value?: unknown): Promise<boolean> } {
     const values = new Map<string, unknown>();
     return {
         isShared: true,
@@ -51,6 +51,11 @@ function sharedStore(): ReplayStore {
             values.set(key, value);
         },
         async putIfAbsent(key, value) {
+            if (values.has(key)) return false;
+            values.set(key, value);
+            return true;
+        },
+        async reserve(key, value = true) {
             if (values.has(key)) return false;
             values.set(key, value);
             return true;
@@ -96,13 +101,22 @@ describe('MPP replay-store adapter wiring', () => {
                 kind: 'subscription',
                 name: 'plan',
                 payTo: SELLER,
-                subscription: { periodCount: 1, periodUnit: 'day', planId: 'plan-1', puller: PULLER },
+                subscription: {
+                    merchant: SELLER,
+                    periodCount: 1,
+                    periodUnit: 'day',
+                    planBump: 255,
+                    planCreatedAt: 1_700_000_000n,
+                    planId: 'plan-1',
+                    planIdNumeric: 1n,
+                    puller: PULLER,
+                },
             },
             { accept: ['mpp'], payTo: SELLER },
         );
         await createMppAdapter(config).challengeHeaders(gate, new Request('http://test/subscription'));
         expect(captured.subscription).toHaveLength(1);
-        await expect(captured.subscription[0].put('solana-subscription:consumed:id', true)).resolves.toBeUndefined();
-        await expect(captured.subscription[0].put('solana-subscription:consumed:id', true)).rejects.toThrow(/reserved/);
+        await expect(captured.subscription[0].reserve('solana-subscription:consumed:id', true)).resolves.toBe(true);
+        await expect(captured.subscription[0].reserve('solana-subscription:consumed:id', true)).resolves.toBe(false);
     });
 });

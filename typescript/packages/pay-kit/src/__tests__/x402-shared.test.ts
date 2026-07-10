@@ -125,11 +125,13 @@ const { Gate } = await import('../gate.js');
 const { usd } = await import('../price.js');
 const { gateDefaults } = await import('../pricing.js');
 const { InvalidProofError } = await import('../errors.js');
+const { createSharedReplayStore } = await import('./test-replay-store.js');
 
 async function payKitConfig() {
     return configure({
         mpp: { challengeBindingSecret: 'x402-cap-secret' },
         network: 'solana_localnet',
+        replayStore: createSharedReplayStore(),
     });
 }
 

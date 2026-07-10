@@ -144,12 +144,13 @@ export function createMppAdapter(config: PayKitConfig): ProtocolAdapter {
                         ...(gate.externalId ? { externalId: gate.externalId } : {}),
                     })(request);
             } else {
-                if (!isAtomicReplayStore(config.replayStore)) {
+                const configuredReplayStore = config.replayStore;
+                if (!configuredReplayStore || !isAtomicReplayStore(configuredReplayStore)) {
                     throw new ConfigurationError(
                         'MPP charge gates require a replayStore with atomic putIfAbsent(key, value).',
                     );
                 }
-                const replayStore = atomicReplayStoreView(config.replayStore);
+                const replayStore = atomicReplayStoreView(configuredReplayStore);
                 const mppx = Mppx.create({
                     methods: [
                         solana.charge({

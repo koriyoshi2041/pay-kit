@@ -6,6 +6,7 @@ import { configure } from '../config.js';
 import { Gate } from '../gate.js';
 import { usd } from '../price.js';
 import { Signer } from '../signer.js';
+import { createSharedReplayStore } from './test-replay-store.js';
 
 const RECIPIENT = 'AyNAa2VPe2t5pgg8M61iE6kqMudkV98zsT4rkAZuU6tj';
 type SessionStoreWithCapability = ReturnType<typeof createMemorySessionStore> & {
@@ -30,6 +31,7 @@ async function configWithStore(sessionStore?: SessionStoreWithCapability) {
         mpp: { challengeBindingSecret: 'session-store-test-secret', sessionStore },
         network: 'solana_devnet',
         operator: { recipient: RECIPIENT, signer: await Signer.generate() },
+        replayStore: createSharedReplayStore(),
     });
 }
 
@@ -58,6 +60,7 @@ describe('MPP session store construction', () => {
             mpp: { challengeBindingSecret: 'session-store-test-secret' },
             network: 'solana_localnet',
             operator: { recipient: RECIPIENT, signer: await Signer.generate() },
+            replayStore: createSharedReplayStore(),
         });
         const engine = createSessionEngine(config, sessionGate());
         await expect(engine.receipt('unknown-channel')).resolves.toBeUndefined();
