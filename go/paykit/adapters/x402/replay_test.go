@@ -93,7 +93,7 @@ func exactCredential(t *testing.T, op paykit.Signer) string {
 }
 
 func binaryPutUint64(b []byte, v uint64) {
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		b[i] = byte(v >> (8 * uint(i)))
 	}
 }
