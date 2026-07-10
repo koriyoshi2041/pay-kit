@@ -768,7 +768,7 @@ final class HandlerUnspecifiedReplayStore implements Store
     }
 }
 
-final class SharedHandlerReplayStore implements DurableStore
+final class SharedHandlerReplayStore implements DurableStore, ReplayStoreCapability
 {
     /** @var array<string, mixed> */
     private array $values = [];

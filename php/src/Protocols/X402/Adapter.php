@@ -189,7 +189,7 @@ final class Adapter
      * Above that boundary keep the decimal form as a string, which preserves
      * the full u64 value without asking a JSON consumer to round it.
      */
-    private static function exactBaseUnits(Gate $gate): int|string
+    private static function exactBaseUnits(Gate $gate): string
     {
         try {
             $amount = $gate->total()->amount->multipliedBy(1_000_000)->toBigInteger();
@@ -201,9 +201,6 @@ final class Adapter
         }
         if ($amount->isNegative() || $amount->isGreaterThan(BigInteger::of('18446744073709551615'))) {
             throw new ConfigurationException('pay_kit: x402 amount must fit an unsigned u64');
-        }
-        if ($amount->isLessThanOrEqualTo(BigInteger::of(PHP_INT_MAX))) {
-            return $amount->toInt();
         }
         return (string) $amount;
     }

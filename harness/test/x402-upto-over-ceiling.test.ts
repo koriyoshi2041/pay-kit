@@ -40,6 +40,7 @@ async function makeUpto(): Promise<X402Upto> {
   // A minimal, offline config (no live RPC needed: the ceiling guard precedes
   // all network work). Mirrors the SDK unit test's testConfig().
   const config = await configure({
+    accept: ["x402"],
     mpp: { challengeBindingSecret: "x402-upto-ceiling-secret" },
     network: "solana_localnet",
   });

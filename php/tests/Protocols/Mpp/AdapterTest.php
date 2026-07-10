@@ -24,7 +24,7 @@ use PayKit\Store\Store;
 use PayKit\Store\DurableStore;
 use PHPUnit\Framework\TestCase;
 
-final class SharedAdapterReplayStore implements DurableStore
+final class SharedAdapterReplayStore implements DurableStore, ReplayStoreCapability
 {
     /** @var array<string, mixed> */
     private array $values = [];

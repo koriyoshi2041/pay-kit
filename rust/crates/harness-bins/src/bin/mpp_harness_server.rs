@@ -363,6 +363,7 @@ fn read_state() -> Result<HarnessState, Box<dyn std::error::Error + Send + Sync>
         let root = read_required_env("MPP_HARNESS_REPLAY_STORE_DIR")?;
         Some(Arc::new(HarnessReplayStore::open(root)?) as Arc<dyn Store>)
     };
+    let allow_unsafe_memory_store = network == "localnet";
 
     Ok(HarnessState {
         mpp: Mpp::new(Config {
@@ -380,7 +381,7 @@ fn read_state() -> Result<HarnessState, Box<dyn std::error::Error + Send + Sync>
             // exercised here, so leave it unset.
             recipient_signer: None,
             store,
-            allow_unsafe_memory_store: false,
+            allow_unsafe_memory_store,
             html: false,
             // Interop tests exercise push mode end-to-end; the gate is
             // opt-in (audit #5) so we set it explicitly here.

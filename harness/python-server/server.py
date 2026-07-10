@@ -68,7 +68,7 @@ from solana_pay_kit import (  # noqa: E402
 )
 from solana_pay_kit._paycore.errors import PaymentError, canonical_code  # noqa: E402
 from solana_pay_kit._paycore.rpc import SolanaRpc  # noqa: E402
-from solana_pay_kit._paycore.store import MemoryStore  # noqa: E402
+from solana_pay_kit._paycore.store import FileReplayStore, MemoryStore  # noqa: E402
 from solana_pay_kit.errors import InvalidProofError  # noqa: E402
 from solana_pay_kit.protocols.mpp.core.headers import format_www_authenticate, parse_authorization, parse_receipt  # noqa: E402
 from solana_pay_kit.protocols.mpp.intents.charge import ChargeRequest  # noqa: E402
@@ -237,7 +237,11 @@ class _Adapter:
             preflight=False,
         ).model_copy()
         self.config = config
-        self.adapter = X402Adapter(config)
+        replay_path = optional_env(
+            "X402_HARNESS_REPLAY_STORE_PATH",
+            str(_repo_root / "target" / "harness-replay" / f"x402-{os.getpid()}.json"),
+        )
+        self.adapter = X402Adapter(config, replay_store=FileReplayStore(replay_path))
         self.pay_to = pay_to
         decimals = int(optional_env("X402_HARNESS_DECIMALS", "6"))
         self.routes = {self.resource_path: _base_units_to_human(amount_units, decimals)}

@@ -18,7 +18,7 @@ use PayKit\Protocols\Mpp\Server\PaymentRequiredResponse;
 use PayKit\Protocols\Mpp\Server\SolanaChargeHandler;
 use PayKit\Store\MemoryStore;
 use PayKit\Store\Store;
-use PayKit\Store\DurableStore;
+use PayKit\Store\ReplayStoreCapability;
 use Psr\Http\Message\ServerRequestInterface;
 use SolanaPhpSdk\Keypair\Keypair;
 use SolanaPhpSdk\Rpc\RpcClient;
@@ -68,10 +68,11 @@ final class Adapter
             );
         }
         if (!$config->mpp->allowUnsafeMemoryStore
-            && (!$replayStore instanceof DurableStore || !$replayStore->isDurable())) {
+            && (!$replayStore instanceof ReplayStoreCapability
+                || !$replayStore->providesDurableSharedReplayProtection())) {
             throw new ConfigurationException(
                 'pay_kit: MPP replay store does not affirm durable/shared capability; '
-                . 'implement DurableStore::isDurable() and return true',
+                . 'implement ReplayStoreCapability and affirm durable shared replay protection',
             );
         }
         $this->replayStore = $replayStore;

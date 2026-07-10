@@ -61,7 +61,9 @@ const pay = await createPayKit({
     mpp: {
         challengeBindingSecret: SECRET_KEY,
         html: true,
-        ...(NETWORK === 'localnet' ? { allowUnsafeMemoryStore: true } : {}),
+        ...(NETWORK === 'localnet' || process.env.PLAYGROUND_DISABLE_SIDECAR === '1'
+            ? { allowUnsafeMemoryStore: true }
+            : {}),
     },
     network: NETWORK,
     operator: { recipient: RECIPIENT, signer: operator },
