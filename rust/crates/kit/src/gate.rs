@@ -147,7 +147,6 @@ impl Default for PayKitConfig {
 /// route on either protocol. Cheap to clone (two `Arc`s).
 #[derive(Clone)]
 pub struct PayKit {
-    accepted_protocols: Vec<Protocol>,
     mpp: Option<Arc<Mpp>>,
     x402: Option<Arc<X402>>,
     /// Usage-based x402 `upto` handler. `Some` only when `fee_payer_signer` is
@@ -301,7 +300,6 @@ impl PayKit {
             .transpose()?;
 
         Ok(Self {
-            accepted_protocols: config.accepted_protocols,
             mpp,
             x402,
             x402_upto,
