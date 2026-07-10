@@ -65,16 +65,16 @@ expectFailure(
   /evidence must not be empty/,
 );
 expectFailure(
-  "missing records require owners",
+  "open delivery records require owners",
   (candidate) => {
     delete candidate.commits[0].owner;
   },
   /owner must be a string/,
 );
 expectFailure(
-  "missing records require follow-ups",
+  "open delivery records require follow-ups",
   (candidate) => {
-    delete candidate.paths.find((record) => record.status === "missing")
+    delete candidate.paths.find((record) => record.status === "open_pr")
       .followUp;
   },
   /followUp must be a string/,
