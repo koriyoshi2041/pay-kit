@@ -875,13 +875,8 @@ mod tests {
     async fn build_with(md: &SubscriptionMethodDetails) -> Result<CredentialPayload, Error> {
         let signer = make_signer();
         let rpc = RpcClient::new_mock("succeeds".to_string());
-        build_subscription_activation_transaction_with_options(
-            &*signer,
-            &rpc,
-            md,
-            test_options(),
-        )
-        .await
+        build_subscription_activation_transaction_with_options(&*signer, &rpc, md, test_options())
+            .await
     }
 
     #[tokio::test(flavor = "multi_thread")]
