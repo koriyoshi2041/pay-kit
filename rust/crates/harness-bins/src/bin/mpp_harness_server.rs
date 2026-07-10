@@ -151,6 +151,7 @@ fn read_state() -> Result<HarnessState, Box<dyn std::error::Error + Send + Sync>
     // reject the misconfig consistently, and refusing to start is the
     // earliest possible signal.
     solana_pay_kit::mpp::protocol::solana::validate_splits(&splits)?;
+    let allow_unsafe_memory_store = network == "localnet";
 
     Ok(HarnessState {
         mpp: Mpp::new(Config {
@@ -168,7 +169,7 @@ fn read_state() -> Result<HarnessState, Box<dyn std::error::Error + Send + Sync>
             // exercised here, so leave it unset.
             recipient_signer: None,
             store: None,
-            allow_unsafe_memory_store: false,
+            allow_unsafe_memory_store,
             html: false,
             // Interop tests exercise push mode end-to-end; the gate is
             // opt-in (audit #5) so we set it explicitly here.
