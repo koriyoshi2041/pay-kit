@@ -81,6 +81,12 @@ jobs:
       - name: Payment-channels revision guard self-test
         working-directory: .
         run: bash scripts/check-payment-channels-revision_test.sh
+      - name: PR216 delivery ledger gate
+        working-directory: .
+        run: node scripts/validate-pr216-ledger.mjs
+      - name: PR216 delivery ledger gate self-test
+        working-directory: .
+        run: node scripts/validate-pr216-ledger_test.mjs
       # Exercise the publish-workflow least-privilege / release-gating guard on
       # every PR, not only on a publish dispatch: the guard's "real workflows
       # pass, reverted fixtures fail" proof otherwise ran only on a developer's

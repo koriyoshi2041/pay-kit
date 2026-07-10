@@ -6,5 +6,8 @@
   "modesByIntent": {
     "charge": ["canonical-bytes"],
     "x402-exact": ["build-transaction", "verify-transaction", "verify-x402-transaction"]
+  },
+  "strictModesByIntent": {
+    "x402-exact": ["verify-transaction", "verify-x402-transaction"]
   }
 }

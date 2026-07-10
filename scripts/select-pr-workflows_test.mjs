@@ -8,32 +8,32 @@ import { WORKFLOWS, selectWorkflows } from "./select-pr-workflows.mjs";
 const none = Object.fromEntries(WORKFLOWS.map((name) => [name, false]));
 const all = Object.fromEntries(WORKFLOWS.map((name) => [name, true]));
 
-function expect(files, enabled) {
+function expectedSelection(enabled) {
+  if (enabled === "all") {
+    return all;
+  }
   const expected = { ...none };
   for (const name of enabled) {
     expected[name] = true;
   }
-  assert.deepEqual(selectWorkflows(files), expected, files.join(", "));
+  return expected;
 }
 
-expect(["go/protocols/x402/verify.go"], ["go"]);
-expect(["typescript/packages/mpp/src/index.ts"], ["typescript"]);
-expect(["html/src/index.ts"], ["typescript"]);
-expect(["rust/crates/kit/src/mpp/lib.rs"], ["rust"]);
-expect(["harness/go-server/main.go"], ["go"]);
-expect(["python/src/solana_pay_kit/protocols/mpp/server/session.py"], ["python"]);
-expect(["harness/python-server/server.py"], ["python"]);
-expect(["ruby/lib/pay_kit/protocols/mpp/store.rb"], ["ruby"]);
-expect(["lua/pay_kit/protocols/mpp/store.lua"], ["lua"]);
-expect(["php/src/Protocol/Mpp/Store.php"], ["php"]);
-expect(["swift/Sources/SolanaPayKit/Protocols/Mpp/Core/CanonicalJSON.swift"], ["swift"]);
-expect(["kotlin/src/main/kotlin/com/solana/paykit/CanonicalJson.kt"], ["kotlin"]);
-expect(["harness/vectors/canonical-bytes.json"], ["harness"]);
-expect(["docs/security.md"], []);
-assert.deepEqual(selectWorkflows(["scripts/unclassified-security-check.sh"]), all);
-assert.deepEqual(selectWorkflows([]), all);
-
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+const fixture = JSON.parse(
+  readFileSync(
+    join(repoRoot, "scripts", "fixtures", "select-pr-workflows.json"),
+    "utf8",
+  ),
+);
+for (const testCase of fixture.cases) {
+  assert.deepEqual(
+    selectWorkflows(testCase.files),
+    expectedSelection(testCase.enabled),
+    testCase.name,
+  );
+}
+
 const routerWorkflow = readFileSync(
   join(repoRoot, ".github", "workflows", "pr-routing.yml"),
   "utf8",
@@ -50,6 +50,9 @@ assert.match(routerWorkflow, /uses: \.\/\.github\/workflows\/ci\.yml/);
 assert.match(coreWorkflow, /^  workflow_call:/m);
 assert.doesNotMatch(coreWorkflow, /^  pull_request:/m);
 assert.doesNotMatch(coreWorkflow, /github\.event_name != 'workflow_call'/);
-assert.match(coreWorkflow, /github\.event_name == 'push' \|\| inputs\.run_typescript/);
+assert.match(
+  coreWorkflow,
+  /github\.event_name == 'push' \|\| inputs\.run_typescript/,
+);
 
 console.log("select-pr-workflows_test: PASS");
