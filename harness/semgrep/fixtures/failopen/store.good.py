@@ -21,3 +21,10 @@ def build_guarded(config, is_localnet):
         raise ValueError("shared store required")
     store = config.store if config.store is not None else MemoryStore()
     return store
+
+
+def build_guarded_absence(config, network):
+    if config.store is None and network != "localnet":
+        raise ValueError("shared store required")
+    store = config.store if config.store is not None else MemoryStore()
+    return store
