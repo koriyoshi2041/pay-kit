@@ -126,6 +126,21 @@ describe('configure', () => {
         expect(production.replayStore).toBe(SHARED_STORE);
     });
 
+    it('honors the explicit in-memory replay-store environment opt-in', async () => {
+        process.env.PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE = '1';
+        try {
+            const config = await configure({
+                mpp: { challengeBindingSecret: 'test-secret' },
+                network: 'solana_devnet',
+                operator: { signer: await Signer.generate() },
+            });
+            expect(config.mpp.allowUnsafeMemoryStore).toBe(true);
+            expect(config.replayStore).toBeDefined();
+        } finally {
+            delete process.env.PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE;
+        }
+    });
+
     it('configures from prefixed environment variables', async () => {
         process.env.PAY_KIT_NETWORK = 'solana_devnet';
         process.env.PAY_KIT_MPP_SECRET = 'env-secret';
