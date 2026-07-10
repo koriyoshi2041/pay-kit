@@ -11,12 +11,17 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from examples.playground_api.app import app
+from examples.playground_api.app import _cfg, app
 
 
 @pytest.fixture
 def client() -> TestClient:
     return TestClient(app)
+
+
+def test_localnet_playground_explicitly_opts_into_memory_replay_store() -> None:
+    assert _cfg.network is _cfg.network.SOLANA_LOCALNET
+    assert _cfg.mpp.allow_unsafe_memory_store is True
 
 
 def test_health_is_free(client: TestClient) -> None:

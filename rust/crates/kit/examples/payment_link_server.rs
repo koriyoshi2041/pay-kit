@@ -165,6 +165,7 @@ async fn main() {
             currency: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string(),
             decimals: 6,
             html: true,
+            allow_unsafe_memory_store: true,
             ..Default::default()
         })
         .expect("valid config"),

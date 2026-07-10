@@ -138,6 +138,7 @@ async fn sol_charge_full_flow() {
         challenge_binding_secret: Some(
             "test-secret-key-for-integration-tests-32b-padding".to_string(),
         ),
+        allow_unsafe_memory_store: true,
         ..Default::default()
     })
     .unwrap();
@@ -197,6 +198,7 @@ async fn sol_charge_wrong_amount_rejected_before_broadcast() {
         challenge_binding_secret: Some(
             "test-secret-key-for-integration-tests-32b-padding".to_string(),
         ),
+        allow_unsafe_memory_store: true,
         ..Default::default()
     })
     .unwrap();
@@ -285,6 +287,7 @@ async fn sol_charge_wrong_recipient_rejected_before_broadcast() {
         challenge_binding_secret: Some(
             "test-secret-key-for-integration-tests-32b-padding".to_string(),
         ),
+        allow_unsafe_memory_store: true,
         ..Default::default()
     })
     .unwrap();
@@ -358,6 +361,7 @@ async fn sol_charge_replay_rejected() {
         challenge_binding_secret: Some(
             "test-secret-key-for-integration-tests-32b-padding".to_string(),
         ),
+        allow_unsafe_memory_store: true,
         ..Default::default()
     })
     .unwrap();
@@ -426,6 +430,7 @@ async fn sol_charge_expired_challenge_rejected() {
         challenge_binding_secret: Some(
             "test-secret-key-for-integration-tests-32b-padding".to_string(),
         ),
+        allow_unsafe_memory_store: true,
         ..Default::default()
     })
     .unwrap();
@@ -478,6 +483,7 @@ async fn sol_charge_www_authenticate_roundtrip() {
         challenge_binding_secret: Some(
             "test-secret-key-for-integration-tests-32b-padding".to_string(),
         ),
+        allow_unsafe_memory_store: true,
         ..Default::default()
     })
     .unwrap();
@@ -554,6 +560,7 @@ async fn usdc_charge_full_flow() {
         challenge_binding_secret: Some(
             "test-secret-key-for-integration-tests-32b-padding".to_string(),
         ),
+        allow_unsafe_memory_store: true,
         ..Default::default()
     })
     .unwrap();
@@ -647,6 +654,7 @@ async fn usdc_charge_wrong_amount_no_broadcast() {
         challenge_binding_secret: Some(
             "test-secret-key-for-integration-tests-32b-padding".to_string(),
         ),
+        allow_unsafe_memory_store: true,
         ..Default::default()
     })
     .unwrap();
