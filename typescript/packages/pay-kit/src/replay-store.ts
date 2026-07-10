@@ -20,21 +20,23 @@ export function isProductionReplayStore(store: ReplayStore): boolean {
 export function createUnsafeMemoryReplayStore(): ReplayStore {
     const values = new Map<string, unknown>();
     return {
+        delete(key) {
+            values.delete(key);
+            return Promise.resolve();
+        },
+        get(key) {
+            return Promise.resolve((values.get(key) ?? null) as never);
+        },
         isDurable: false,
         isShared: false,
-        async delete(key) {
-            values.delete(key);
-        },
-        async get(key) {
-            return (values.get(key) ?? null) as never;
-        },
-        async put(key, value) {
+        put(key, value) {
             values.set(key, value);
+            return Promise.resolve();
         },
-        async putIfAbsent(key, value) {
-            if (values.has(key)) return false;
+        putIfAbsent(key, value) {
+            if (values.has(key)) return Promise.resolve(false);
             values.set(key, value);
-            return true;
+            return Promise.resolve(true);
         },
     };
 }

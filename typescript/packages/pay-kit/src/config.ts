@@ -4,13 +4,8 @@ import type { Store } from 'mppx';
 import { ConfigurationError, DemoSignerOnMainnetError, ProtocolNotSupportedError } from './errors.js';
 import { type Stablecoin, STABLECOINS } from './price.js';
 import { type Network, type NetworkSlug, type Protocol, toNetwork, toSolanaNetwork } from './protocol.js';
+import { createUnsafeMemoryReplayStore, isAtomicReplayStore, isProductionReplayStore } from './replay-store.js';
 import { type KeychainSigner, type PayKitSigner, Signer } from './signer.js';
-import {
-    createUnsafeMemoryReplayStore,
-    isAtomicReplayStore,
-    isProductionReplayStore,
-    type ReplayStore,
-} from './replay-store.js';
 
 /** MPP protocol options. */
 export type MppOptions = {
@@ -80,8 +75,8 @@ export type ConfigureParams = {
 export type PayKitConfig = {
     readonly accept: readonly Protocol[];
     readonly mpp: {
-        readonly challengeBindingSecret: string;
         readonly allowUnsafeMemoryStore: boolean;
+        readonly challengeBindingSecret: string;
         readonly expiresIn: number;
         readonly html: boolean;
         readonly realm: string;
@@ -180,7 +175,7 @@ export async function configure(params: ConfigureParams = {}): Promise<PayKitCon
         : (params.mpp?.challengeBindingSecret ?? '');
 
     const allowUnsafeMemoryStore = params.mpp?.allowUnsafeMemoryStore ?? false;
-    let replayStore: Store.Store | ReplayStore | undefined = params.replayStore;
+    let replayStore: Store.Store | undefined = params.replayStore;
     if (accept.includes('mpp')) {
         if (replayStore === undefined && allowUnsafeMemoryStore) {
             console.warn(

@@ -57,9 +57,7 @@ export function createMppAdapter(config: PayKitConfig): ProtocolAdapter {
         throw new ConfigurationError('MPP adapter replayStore must implement atomic putIfAbsent(key, value).');
     }
     if (!config.mpp.allowUnsafeMemoryStore && !isProductionReplayStore(config.replayStore)) {
-        throw new ConfigurationError(
-            'MPP adapter replayStore must affirmatively set isShared=true or isDurable=true.',
-        );
+        throw new ConfigurationError('MPP adapter replayStore must affirmatively set isShared=true or isDurable=true.');
     }
     const replayStore = atomicReplayStoreView(config.replayStore);
     const network = toSolanaNetwork(config.network);
@@ -98,8 +96,8 @@ export function createMppAdapter(config: PayKitConfig): ProtocolAdapter {
                             puller,
                             recipient: gate.payTo,
                             rpcUrl: config.rpcUrl,
-                            tokenProgram: TOKEN_PROGRAM,
                             store: replayStore,
+                            tokenProgram: TOKEN_PROGRAM,
                             ...signer,
                         }),
                     ],

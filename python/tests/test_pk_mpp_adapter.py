@@ -116,6 +116,7 @@ def test_non_localnet_uses_store_from_mpp_config(tmp_path):
     adapter = MppAdapter(cfg)
     assert adapter._replay_store is store
     core = PayCore.for_config(cfg)
+    assert core._mpp is not None
     assert core._mpp._replay_store is store
 
 

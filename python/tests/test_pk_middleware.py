@@ -86,8 +86,12 @@ def test_for_config_returns_same_core_per_config():
     second = PayCore.for_config(cfg)
     assert first is second
     # The MPP adapter (and its replay store) is shared, not rebuilt per call.
-    assert first._mpp is second._mpp
-    assert first._mpp._replay_store is second._mpp._replay_store
+    first_mpp = first._mpp
+    second_mpp = second._mpp
+    assert first_mpp is not None
+    assert second_mpp is not None
+    assert first_mpp is second_mpp
+    assert first_mpp._replay_store is second_mpp._replay_store
 
 
 def test_for_config_distinct_cores_for_distinct_configs():
@@ -107,13 +111,17 @@ async def test_settled_signature_not_replayable_across_requests(monkeypatch):
     """End-to-end of the cache: a signature consumed on the shared replay store
     by one request's core stays consumed for the next request's core."""
     cfg = _cfg(accept=(Protocol.MPP,))
-    store = PayCore.for_config(cfg)._mpp._replay_store
+    mpp = PayCore.for_config(cfg)._mpp
+    assert mpp is not None
+    store = mpp._replay_store
     key = "solana-charge:consumed:sig-xyz"
     # First request settles the signature (marks it consumed).
     assert await store.put_if_absent(key, True) is True
     # A later request resolves the SAME core/store, so the marker persists and
     # a replay of the same signature is rejected (put_if_absent returns False).
-    store_again = PayCore.for_config(cfg)._mpp._replay_store
+    mpp_again = PayCore.for_config(cfg)._mpp
+    assert mpp_again is not None
+    store_again = mpp_again._replay_store
     assert store_again is store
     assert await store_again.put_if_absent(key, True) is False
 
@@ -291,7 +299,9 @@ async def test_process_dispatches_to_adapter(monkeypatch):
     async def fake_verify(gate, request):
         return sentinel
 
-    monkeypatch.setattr(core._mpp, "verify_and_settle", fake_verify)
+    mpp = core._mpp
+    assert mpp is not None
+    monkeypatch.setattr(mpp, "verify_and_settle", fake_verify)
     out = await core.process(g, None, _Req(headers={"authorization": "Payment abc"}))
     assert out is sentinel
 

@@ -41,9 +41,15 @@ function sharedStore(): ReplayStore {
     const values = new Map<string, unknown>();
     return {
         isShared: true,
-        async delete(key) { values.delete(key); },
-        async get(key) { return (values.get(key) ?? null) as never; },
-        async put(key, value) { values.set(key, value); },
+        async delete(key) {
+            values.delete(key);
+        },
+        async get(key) {
+            return (values.get(key) ?? null) as never;
+        },
+        async put(key, value) {
+            values.set(key, value);
+        },
         async putIfAbsent(key, value) {
             if (values.has(key)) return false;
             values.set(key, value);
@@ -65,7 +71,10 @@ describe('MPP replay-store adapter wiring', () => {
             operator: { recipient: SELLER, signer: await Signer.generate() },
             replayStore,
         });
-        const gate = Gate.create({ amount: usd('1.00'), name: 'charge', payTo: SELLER }, { accept: ['mpp'], payTo: SELLER });
+        const gate = Gate.create(
+            { amount: usd('1.00'), name: 'charge', payTo: SELLER },
+            { accept: ['mpp'], payTo: SELLER },
+        );
         const adapters = [createMppAdapter(config), createMppAdapter(config)];
         await Promise.all(adapters.map(adapter => adapter.challengeHeaders(gate, new Request('http://test/charge'))));
 

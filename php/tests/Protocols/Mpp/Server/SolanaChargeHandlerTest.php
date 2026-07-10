@@ -19,6 +19,7 @@ use PayKit\Protocols\Mpp\Server\VerificationResult;
 use PayKit\Store\FileStore;
 use PayKit\Store\MemoryStore;
 use PayKit\Store\DurableStore;
+use PayKit\Store\Store;
 use SolanaPhpSdk\Util\Base58;
 use SolanaPhpSdk\Keypair\Keypair;
 use SolanaPhpSdk\Keypair\PublicKey;

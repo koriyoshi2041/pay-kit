@@ -10,9 +10,15 @@ const SECRET = { mpp: { challengeBindingSecret: 'test-secret', allowUnsafeMemory
 const values = new Map<string, unknown>();
 const SHARED_STORE: ReplayStore = {
     isShared: true,
-    async delete(key) { values.delete(key); },
-    async get(key) { return (values.get(key) ?? null) as never; },
-    async put(key, value) { values.set(key, value); },
+    async delete(key) {
+        values.delete(key);
+    },
+    async get(key) {
+        return (values.get(key) ?? null) as never;
+    },
+    async put(key, value) {
+        values.set(key, value);
+    },
     async putIfAbsent(key, value) {
         if (values.has(key)) return false;
         values.set(key, value);
@@ -21,7 +27,9 @@ const SHARED_STORE: ReplayStore = {
 };
 const LEGACY_STORE: Store.Store = {
     async delete() {},
-    async get() { return null; },
+    async get() {
+        return null;
+    },
     async put() {},
 };
 
@@ -93,14 +101,14 @@ describe('configure', () => {
 
     it('requires an injected replay store outside localnet', async () => {
         const signer = await Signer.generate();
-        await expect(configure({
-            ...SECRET,
-            mpp: { challengeBindingSecret: 'test-secret' },
-            network: 'solana_devnet',
-            operator: { signer },
-        })).rejects.toThrow(
-            /atomic shared replayStore/,
-        );
+        await expect(
+            configure({
+                ...SECRET,
+                mpp: { challengeBindingSecret: 'test-secret' },
+                network: 'solana_devnet',
+                operator: { signer },
+            }),
+        ).rejects.toThrow(/atomic shared replayStore/);
 
         await expect(configure({ mpp: { challengeBindingSecret: 'test-secret' } })).rejects.toThrow(
             /atomic shared replayStore/,
