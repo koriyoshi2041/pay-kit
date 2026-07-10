@@ -13,6 +13,8 @@ use PayKit\Middleware\RequirePayment;
 use PayKit\PayCore\HttpFactory;
 use PayKit\Payment;
 use PayKit\Pricing;
+use PayKit\Protocol;
+use PayKit\Protocols\Mpp\Adapter as MppAdapter;
 use Psr\Http\Message\ResponseFactoryInterface;
 use Psr\Http\Message\StreamFactoryInterface;
 use Symfony\Bridge\PsrHttpMessage\Factory\HttpFoundationFactory;
@@ -81,7 +83,10 @@ final class RequirePaymentMiddleware
             }
         };
 
-        $mw = new RequirePayment($this->client, $gateRef, $pricing);
+        $mpp = in_array(Protocol::Mpp, $this->client->config->accept, true)
+            ? $this->container->make(MppAdapter::class)
+            : null;
+        $mw = new RequirePayment($this->client, $gateRef, $pricing, $mpp);
         $psrResponse = $mw->process($psrRequest, $handler);
 
         if ($psrResponse->getStatusCode() === 402) {

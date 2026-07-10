@@ -39,7 +39,7 @@ use Psr\Http\Server\RequestHandlerInterface;
  */
 final class RequirePayment implements MiddlewareInterface
 {
-    private MppAdapter $mpp;
+    private ?MppAdapter $mpp;
     private ?X402Adapter $x402;
 
     /**
@@ -52,7 +52,10 @@ final class RequirePayment implements MiddlewareInterface
         ?MppAdapter $mpp = null,
         ?X402Adapter $x402 = null,
     ) {
-        $this->mpp  = $mpp ?? new MppAdapter($client->config);
+        $this->mpp = $mpp;
+        if ($this->mpp === null && in_array(Protocol::Mpp, $client->config->accept, true)) {
+            $this->mpp = new MppAdapter($client->config);
+        }
         // Auto-wire the X402 adapter when the client's accept list
         // includes Protocol::X402. Callers can still pass an explicit
         // adapter to override (e.g. with an offline blockhash provider).
@@ -118,7 +121,7 @@ final class RequirePayment implements MiddlewareInterface
             if ($protocol === Protocol::X402 && $sig !== '' && $this->x402 !== null) {
                 return $this->x402;
             }
-            if ($protocol === Protocol::Mpp && $auth !== '' && stripos($auth, 'payment ') === 0) {
+            if ($protocol === Protocol::Mpp && $this->mpp !== null && $auth !== '' && stripos($auth, 'payment ') === 0) {
                 return $this->mpp;
             }
         }
@@ -135,7 +138,7 @@ final class RequirePayment implements MiddlewareInterface
             $accepts[] = $this->x402->acceptsEntry($gate, $request);
             $headers   = array_merge($headers, $this->x402->challengeHeaders($gate, $request));
         }
-        if (in_array(Protocol::Mpp, $accept, true)) {
+        if ($this->mpp !== null && in_array(Protocol::Mpp, $accept, true)) {
             $accepts[] = $this->mpp->acceptsEntry($gate, $request);
             $headers   = array_merge($headers, $this->mpp->challengeHeaders($gate, $request));
         }

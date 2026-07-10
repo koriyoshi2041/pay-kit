@@ -54,7 +54,7 @@ def _cfg(accept=(Protocol.X402, Protocol.MPP)):
         network="solana_localnet",
         preflight=False,
         accept=accept,
-        mpp=MppConfig(challenge_binding_secret=SECRET),
+        mpp=MppConfig(challenge_binding_secret=SECRET, allow_unsafe_memory_store=True),
     )
 
 

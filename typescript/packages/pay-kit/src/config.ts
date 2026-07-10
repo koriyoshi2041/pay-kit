@@ -5,9 +5,17 @@ import { ConfigurationError, DemoSignerOnMainnetError, ProtocolNotSupportedError
 import { type Stablecoin, STABLECOINS } from './price.js';
 import { type Network, type NetworkSlug, type Protocol, toNetwork, toSolanaNetwork } from './protocol.js';
 import { type KeychainSigner, type PayKitSigner, Signer } from './signer.js';
+import {
+    createUnsafeMemoryReplayStore,
+    isAtomicReplayStore,
+    isProductionReplayStore,
+    type ReplayStore,
+} from './replay-store.js';
 
 /** MPP protocol options. */
 export type MppOptions = {
+    /** Explicitly permit process-local replay state for development/tests. */
+    readonly allowUnsafeMemoryStore?: boolean;
     /**
      * HMAC secret binding challenges to their contents. Resolved from
      * `PAY_KIT_MPP_SECRET` or `MPP_SECRET_KEY` when omitted; auto-generated
@@ -59,7 +67,7 @@ export type ConfigureParams = {
     readonly operator?: OperatorParams;
     /** Run boot-time safety checks. */
     readonly preflight?: boolean;
-    /** Replay-protection store. Use a persistent backend in production. */
+    /** Replay-protection store. MPP validates atomic/shared capability at runtime. */
     readonly replayStore?: Store.Store;
     /** Defaults to the public RPC endpoint for the network. */
     readonly rpcUrl?: string;
@@ -73,6 +81,7 @@ export type PayKitConfig = {
     readonly accept: readonly Protocol[];
     readonly mpp: {
         readonly challengeBindingSecret: string;
+        readonly allowUnsafeMemoryStore: boolean;
         readonly expiresIn: number;
         readonly html: boolean;
         readonly realm: string;
@@ -170,9 +179,38 @@ export async function configure(params: ConfigureParams = {}): Promise<PayKitCon
         ? resolveChallengeBindingSecret(network, params.mpp?.challengeBindingSecret)
         : (params.mpp?.challengeBindingSecret ?? '');
 
+    const allowUnsafeMemoryStore = params.mpp?.allowUnsafeMemoryStore ?? false;
+    let replayStore: Store.Store | ReplayStore | undefined = params.replayStore;
+    if (accept.includes('mpp')) {
+        if (replayStore === undefined && allowUnsafeMemoryStore) {
+            console.warn(
+                '[pay-kit] MPP explicitly enabled a process-local replay store. ' +
+                    'Replay markers are lost on restart and are not shared across workers.',
+            );
+            replayStore = createUnsafeMemoryReplayStore();
+        }
+        if (replayStore === undefined) {
+            throw new ConfigurationError(
+                'MPP requires an injected atomic shared replayStore; ' +
+                    'mpp.allowUnsafeMemoryStore is development-only.',
+            );
+        }
+        if (!isAtomicReplayStore(replayStore)) {
+            throw new ConfigurationError(
+                'MPP replayStore must implement atomic putIfAbsent(key, value); legacy non-atomic stores fail closed.',
+            );
+        }
+        if (!allowUnsafeMemoryStore && !isProductionReplayStore(replayStore)) {
+            throw new ConfigurationError(
+                'MPP replayStore must affirmatively set isShared=true or isDurable=true; unknown stores fail closed.',
+            );
+        }
+    }
+
     return Object.freeze({
         accept: Object.freeze([...accept]),
         mpp: Object.freeze({
+            allowUnsafeMemoryStore,
             challengeBindingSecret,
             expiresIn,
             html: params.mpp?.html ?? false,
@@ -181,7 +219,7 @@ export async function configure(params: ConfigureParams = {}): Promise<PayKitCon
         network,
         operator: Object.freeze(operator),
         preflight: params.preflight ?? true,
-        replayStore: params.replayStore,
+        replayStore,
         rpcUrl: params.rpcUrl ?? DEFAULT_RPC_URLS[toSolanaNetwork(network)] ?? DEFAULT_RPC_URLS.mainnet,
         stablecoins: Object.freeze([...stablecoins]),
         x402: Object.freeze({}),
@@ -193,9 +231,10 @@ export async function configure(params: ConfigureParams = {}): Promise<PayKitCon
  * variables: `NETWORK`, `RPC_URL`, `ACCEPT` and `STABLECOINS`
  * (comma-separated), `OPERATOR_KEY` (any encoding {@link Signer.env}
  * accepts), `RECIPIENT`, `FEE_PAYER`, `MPP_REALM`, `MPP_SECRET`,
- * `MPP_EXPIRES_IN`, and `PREFLIGHT`.
+ * `MPP_EXPIRES_IN`, and `PREFLIGHT`. Pass `replayStore` separately because a
+ * shared store is an application object, not an environment scalar.
  */
-export async function configureFromEnv(prefix = 'PAY_KIT_'): Promise<PayKitConfig> {
+export async function configureFromEnv(prefix = 'PAY_KIT_', replayStore?: Store.Store): Promise<PayKitConfig> {
     const env = (name: string) => process.env[`${prefix}${name}`]?.trim() || undefined;
     const list = (value: string | undefined) => value?.split(',').map(entry => entry.trim()) ?? undefined;
 
@@ -214,6 +253,7 @@ export async function configureFromEnv(prefix = 'PAY_KIT_'): Promise<PayKitConfi
             signer: await Signer.env(`${prefix}OPERATOR_KEY`),
         },
         preflight: env('PREFLIGHT') === undefined ? undefined : env('PREFLIGHT') !== 'false',
+        replayStore,
         rpcUrl: env('RPC_URL'),
     });
 }

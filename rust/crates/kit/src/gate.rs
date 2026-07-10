@@ -37,6 +37,7 @@ use axum::routing::{get, post, MethodRouter};
 
 use crate::mpp::server::{Config as MppConfig, Mpp};
 use crate::mpp::solana_keychain::SolanaSigner;
+use crate::mpp::store::Store;
 use crate::mpp::{format_receipt, format_www_authenticate, Receipt, ReceiptKind};
 use crate::x402::server::{
     BatchConfig, Config as X402Config, CurrencyConfig, ExactOptions, UptoConfig, UptoPayout,
@@ -73,6 +74,9 @@ impl std::error::Error for PayKitError {}
 /// Set [`fee_payer_signer`](Self::fee_payer_signer) to sponsor network fees —
 /// it drives MPP's fee-sponsored mode and supplies x402's fee-payer address.
 pub struct PayKitConfig {
+    /// Protocols accepted by the unified gate. Defaults to both MPP and x402,
+    /// preserving the historical dual-protocol behavior.
+    pub accepted_protocols: Vec<Protocol>,
     /// The merchant wallet address that receives payment.
     pub recipient: String,
     /// Currency symbol or mint address (default `"USDC"`).
@@ -91,6 +95,12 @@ pub struct PayKitConfig {
     pub fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
     /// Accept push-mode MPP credentials (off by default; see audit §13.5).
     pub accept_push_mode: bool,
+    /// Atomic shared MPP replay store. The low-level MPP constructor requires
+    /// `Store::is_shared()` to affirmatively return true.
+    pub mpp_replay_store: Option<Arc<dyn Store>>,
+    /// Explicit development-only escape hatch for process-local MPP replay
+    /// state. Defaults to false; localnet alone never opts in.
+    pub allow_unsafe_mpp_memory_store: bool,
     /// Currencies the server is willing to accept (x402 multi-currency).
     pub accepted_currencies: Option<Vec<String>>,
 }
@@ -98,6 +108,7 @@ pub struct PayKitConfig {
 impl Default for PayKitConfig {
     fn default() -> Self {
         Self {
+            accepted_protocols: vec![Protocol::Mpp, Protocol::X402],
             recipient: String::new(),
             currency: "USDC".to_string(),
             decimals: 6,
@@ -106,6 +117,8 @@ impl Default for PayKitConfig {
             challenge_binding_secret: None,
             fee_payer_signer: None,
             accept_push_mode: false,
+            mpp_replay_store: None,
+            allow_unsafe_mpp_memory_store: false,
             accepted_currencies: None,
         }
     }
@@ -118,7 +131,8 @@ impl Default for PayKitConfig {
 /// route on either protocol. Cheap to clone (two `Arc`s).
 #[derive(Clone)]
 pub struct PayKit {
-    mpp: Arc<Mpp>,
+    accepted_protocols: Vec<Protocol>,
+    mpp: Option<Arc<Mpp>>,
     x402: Arc<X402>,
     /// Usage-based x402 `upto` handler. `Some` only when `fee_payer_signer` is
     /// set — the operator must sign settlement vouchers, so `upto` routes
@@ -163,19 +177,28 @@ impl PayKit {
             }],
         };
 
-        let mpp = Mpp::new(MppConfig {
-            recipient: config.recipient.clone(),
-            currency: config.currency.clone(),
-            decimals: config.decimals,
-            network: config.network.clone(),
-            rpc_url: config.rpc_url.clone(),
-            challenge_binding_secret: config.challenge_binding_secret.clone(),
-            fee_payer: config.fee_payer_signer.is_some(),
-            fee_payer_signer: config.fee_payer_signer.clone(),
-            accept_push_mode: config.accept_push_mode,
-            ..Default::default()
-        })
-        .map_err(|e| PayKitError::Mpp(e.to_string()))?;
+        let mpp = config
+            .accepted_protocols
+            .contains(&Protocol::Mpp)
+            .then(|| {
+                Mpp::new(MppConfig {
+                    recipient: config.recipient.clone(),
+                    currency: config.currency.clone(),
+                    decimals: config.decimals,
+                    network: config.network.clone(),
+                    rpc_url: config.rpc_url.clone(),
+                    challenge_binding_secret: config.challenge_binding_secret.clone(),
+                    fee_payer: config.fee_payer_signer.is_some(),
+                    fee_payer_signer: config.fee_payer_signer.clone(),
+                    accept_push_mode: config.accept_push_mode,
+                    store: config.mpp_replay_store.clone(),
+                    allow_unsafe_memory_store: config.allow_unsafe_mpp_memory_store,
+                    ..Default::default()
+                })
+                .map(Arc::new)
+                .map_err(|e| PayKitError::Mpp(e.to_string()))
+            })
+            .transpose()?;
 
         let x402 = X402::new(X402Config {
             recipient: config.recipient.clone(),
@@ -233,7 +256,8 @@ impl PayKit {
             .transpose()?;
 
         Ok(Self {
-            mpp: Arc::new(mpp),
+            accepted_protocols: config.accepted_protocols,
+            mpp,
             x402: Arc::new(x402),
             x402_upto,
             x402_batch,
@@ -242,7 +266,9 @@ impl PayKit {
 
     /// The underlying MPP charge handler.
     pub fn mpp(&self) -> &Arc<Mpp> {
-        &self.mpp
+        self.mpp
+            .as_ref()
+            .expect("MPP is disabled in PayKitConfig.accepted_protocols")
     }
 
     /// The underlying x402 handler.
@@ -486,38 +512,44 @@ fn challenge_response(pay: &PayKit, amount: &str) -> Response {
 
     // MPP: WWW-Authenticate. A failure here drops the MPP challenge from the
     // 402 (x402 clients are unaffected), so log it for operators.
-    match pay.mpp.charge(amount) {
-        Ok(challenge) => match format_www_authenticate(&challenge) {
-            Ok(www_auth) => match HeaderValue::from_str(&www_auth) {
-                Ok(v) => {
-                    headers.insert(header::WWW_AUTHENTICATE, v);
-                }
+    if let Some(mpp) = &pay.mpp {
+        match mpp.charge(amount) {
+            Ok(challenge) => match format_www_authenticate(&challenge) {
+                Ok(www_auth) => match HeaderValue::from_str(&www_auth) {
+                    Ok(v) => {
+                        headers.insert(header::WWW_AUTHENTICATE, v);
+                    }
+                    Err(e) => {
+                        tracing::warn!(amount = %amount, error = %e, "invalid MPP challenge header value")
+                    }
+                },
                 Err(e) => {
-                    tracing::warn!(amount = %amount, error = %e, "invalid MPP challenge header value")
+                    tracing::warn!(amount = %amount, error = %e, "failed to format MPP challenge")
                 }
             },
-            Err(e) => {
-                tracing::warn!(amount = %amount, error = %e, "failed to format MPP challenge")
-            }
-        },
-        Err(e) => tracing::warn!(amount = %amount, error = %e, "failed to build MPP challenge"),
+            Err(e) => tracing::warn!(amount = %amount, error = %e, "failed to build MPP challenge"),
+        }
     }
 
     // x402: PAYMENT-REQUIRED.
-    match pay
-        .x402
-        .payment_required_header(amount, ExactOptions::default())
-    {
-        Ok((name, value)) => match (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(&value),
-        ) {
-            (Ok(n), Ok(v)) => {
-                headers.insert(n, v);
+    if pay.accepted_protocols.contains(&Protocol::X402) {
+        match pay
+            .x402
+            .payment_required_header(amount, ExactOptions::default())
+        {
+            Ok((name, value)) => match (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(&value),
+            ) {
+                (Ok(n), Ok(v)) => {
+                    headers.insert(n, v);
+                }
+                _ => tracing::warn!(amount = %amount, "invalid x402 PAYMENT-REQUIRED header"),
+            },
+            Err(e) => {
+                tracing::warn!(amount = %amount, error = %e, "failed to build x402 challenge")
             }
-            _ => tracing::warn!(amount = %amount, "invalid x402 PAYMENT-REQUIRED header"),
-        },
-        Err(e) => tracing::warn!(amount = %amount, error = %e, "failed to build x402 challenge"),
+        }
     }
 
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -588,13 +620,8 @@ async fn gate_middleware(State(state): State<GateState>, mut req: Request, next:
         .map(str::to_string);
 
     // MPP path.
-    if let Some(credential) = mpp_credential {
-        return match state
-            .pay
-            .mpp
-            .verify_payment_for_amount(&credential, &amount)
-            .await
-        {
+    if let (Some(credential), Some(mpp)) = (mpp_credential, state.pay.mpp.as_ref()) {
+        return match mpp.verify_payment_for_amount(&credential, &amount).await {
             Ok(receipt) => {
                 req.extensions_mut().insert(Payment {
                     amount,
@@ -610,7 +637,9 @@ async fn gate_middleware(State(state): State<GateState>, mut req: Request, next:
     }
 
     // x402 path.
-    if let Some(header_value) = x402_header {
+    if let Some(header_value) =
+        x402_header.filter(|_| state.pay.accepted_protocols.contains(&Protocol::X402))
+    {
         return match state
             .pay
             .x402
@@ -984,6 +1013,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mpp::store::{MemoryStore, StoreError};
     use axum::body::Body;
     use axum::Router;
     use tower::ServiceExt; // oneshot
@@ -991,11 +1021,95 @@ mod tests {
     const TEST_RECIPIENT: &str = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
     const TEST_SECRET: &str = "paykit-gate-test-secret-key-with-32b-padding";
 
+    struct SharedReplayStore(MemoryStore);
+
+    impl Store for SharedReplayStore {
+        fn is_shared(&self) -> bool {
+            true
+        }
+        fn get(
+            &self,
+            key: &str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Option<serde_json::Value>, StoreError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.0.get(key)
+        }
+        fn put(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StoreError>> + Send + '_>>
+        {
+            self.0.put(key, value)
+        }
+        fn delete(
+            &self,
+            key: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StoreError>> + Send + '_>>
+        {
+            self.0.delete(key)
+        }
+        fn put_if_absent(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, StoreError>> + Send + '_>,
+        > {
+            self.0.put_if_absent(key, value)
+        }
+    }
+
+    #[test]
+    fn paykit_requires_shared_mpp_replay_store() {
+        let error = PayKit::new(PayKitConfig {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            network: "devnet".to_string(),
+            ..Default::default()
+        })
+        .err()
+        .expect("missing high-level replay store must fail");
+        assert!(error.to_string().contains("atomic shared replay store"));
+    }
+
+    #[test]
+    fn paykit_forwards_injected_shared_mpp_replay_store() {
+        let paykit = PayKit::new(PayKitConfig {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            network: "devnet".to_string(),
+            mpp_replay_store: Some(Arc::new(SharedReplayStore(MemoryStore::new()))),
+            ..Default::default()
+        });
+        assert!(paykit.is_ok());
+    }
+
+    #[test]
+    fn paykit_x402_only_does_not_construct_mpp() {
+        let paykit = PayKit::new(PayKitConfig {
+            accepted_protocols: vec![Protocol::X402],
+            recipient: TEST_RECIPIENT.to_string(),
+            network: "devnet".to_string(),
+            challenge_binding_secret: None,
+            mpp_replay_store: None,
+            ..Default::default()
+        })
+        .expect("x402-only PayKit must not require MPP configuration");
+        assert!(paykit.mpp.is_none());
+    }
+
     fn test_paykit() -> PayKit {
         PayKit::new(PayKitConfig {
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             network: "devnet".to_string(),
+            allow_unsafe_mpp_memory_store: true,
             ..Default::default()
         })
         .expect("valid paykit config")
@@ -1023,6 +1137,7 @@ mod tests {
             network: "devnet".to_string(),
             rpc_url: Some("http://127.0.0.1:1".to_string()),
             fee_payer_signer: Some(test_signer()),
+            allow_unsafe_mpp_memory_store: true,
             ..Default::default()
         })
         .expect("valid paykit config")

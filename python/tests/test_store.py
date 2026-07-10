@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+import multiprocessing
 from pathlib import Path
 
 import pytest
 
 from solana_pay_kit._paycore.store import FileReplayStore, MemoryStore, Store
+
+
+def _reserve_in_process(path: str, start, results) -> None:
+    start.wait()
+    reserved = asyncio.run(FileReplayStore(path).put_if_absent("shared-signature", True))
+    results.put(reserved)
 
 
 class TestMemoryStore:
@@ -84,6 +92,20 @@ class TestFileReplayStore:
         second = FileReplayStore(store_path)
         assert await second.get("sig") is True
         assert await second.put_if_absent("sig", True) is False
+
+    def test_put_if_absent_is_atomic_across_processes(self, store_path: Path):
+        ctx = multiprocessing.get_context("spawn")
+        start = ctx.Event()
+        results = ctx.Queue()
+        workers = [ctx.Process(target=_reserve_in_process, args=(str(store_path), start, results)) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        start.set()
+        observed = sorted(results.get(timeout=10) for _ in workers)
+        for worker in workers:
+            worker.join(timeout=10)
+            assert worker.exitcode == 0
+        assert observed == [False, True]
 
     async def test_delete_persists(self, store_path: Path):
         first = FileReplayStore(store_path)

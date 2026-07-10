@@ -32,7 +32,7 @@ def _cfg():
         network="solana_localnet",
         preflight=False,
         accept=(Protocol.MPP,),
-        mpp=MppConfig(challenge_binding_secret=SECRET),
+        mpp=MppConfig(challenge_binding_secret=SECRET, allow_unsafe_memory_store=True),
     )
 
 

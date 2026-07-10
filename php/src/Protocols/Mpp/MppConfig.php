@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace PayKit\Protocols\Mpp;
 
 use PayKit\Exception\ConfigurationException;
+use PayKit\Store\Store;
 
 /**
  * MPP scheme sub-configuration. `challengeBindingSecret` is the
@@ -37,6 +38,8 @@ final readonly class MppConfig
         public ?string $challengeBindingSecret = null,
         public int $expiresIn = 120,
         public bool $acceptPushMode = false,
+        public ?Store $replayStore = null,
+        public bool $allowUnsafeMemoryStore = false,
     ) {
         if ($expiresIn < 0) {
             throw new ConfigurationException(
@@ -55,7 +58,14 @@ final readonly class MppConfig
 
     public function withChallengeBindingSecret(string $secret): self
     {
-        return new self($this->realm, $secret, $this->expiresIn, $this->acceptPushMode);
+        return new self(
+            $this->realm,
+            $secret,
+            $this->expiresIn,
+            $this->acceptPushMode,
+            $this->replayStore,
+            $this->allowUnsafeMemoryStore,
+        );
     }
 
     /**

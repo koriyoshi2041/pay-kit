@@ -1,10 +1,29 @@
 import { describe, expect, it } from 'vitest';
+import type { Store } from 'mppx';
 
 import { configure, configureFromEnv } from '../config.js';
 import { ConfigurationError, DemoSignerOnMainnetError, ProtocolNotSupportedError } from '../errors.js';
+import type { ReplayStore } from '../replay-store.js';
 import { Signer } from '../signer.js';
 
-const SECRET = { mpp: { challengeBindingSecret: 'test-secret' } };
+const SECRET = { mpp: { challengeBindingSecret: 'test-secret', allowUnsafeMemoryStore: true } };
+const values = new Map<string, unknown>();
+const SHARED_STORE: ReplayStore = {
+    isShared: true,
+    async delete(key) { values.delete(key); },
+    async get(key) { return (values.get(key) ?? null) as never; },
+    async put(key, value) { values.set(key, value); },
+    async putIfAbsent(key, value) {
+        if (values.has(key)) return false;
+        values.set(key, value);
+        return true;
+    },
+};
+const LEGACY_STORE: Store.Store = {
+    async delete() {},
+    async get() { return null; },
+    async put() {},
+};
 
 describe('configure', () => {
     it('applies the canonical defaults', async () => {
@@ -24,13 +43,29 @@ describe('configure', () => {
     it('refuses the demo signer on mainnet', async () => {
         await expect(configure({ ...SECRET, network: 'solana_mainnet' })).rejects.toThrow(DemoSignerOnMainnetError);
         const signer = await Signer.generate();
-        const config = await configure({ ...SECRET, network: 'solana_mainnet', operator: { signer } });
+        const config = await configure({
+            ...SECRET,
+            network: 'solana_mainnet',
+            operator: { signer },
+            replayStore: SHARED_STORE,
+        });
         expect(config.operator.recipient).toBe(signer.pubkey);
     });
 
     it('accepts the shipped protocols (mpp + x402)', async () => {
         const config = await configure({ ...SECRET, accept: ['x402', 'mpp'] });
         expect(config.accept).toEqual(['x402', 'mpp']);
+    });
+
+    it('does not require or construct an MPP replay store for x402-only config', async () => {
+        // Store.Store remains accepted by the public input type for source compatibility.
+        const config = await configure({ accept: ['x402'], replayStore: LEGACY_STORE });
+        expect(config.accept).toEqual(['x402']);
+        expect(config.replayStore).toBe(LEGACY_STORE);
+    });
+
+    it('fails closed at runtime for a legacy non-atomic MPP store', async () => {
+        await expect(configure({ ...SECRET, replayStore: LEGACY_STORE })).rejects.toThrow(/atomic putIfAbsent/);
     });
 
     it('rejects protocols this SDK does not ship', async () => {
@@ -51,9 +86,36 @@ describe('configure', () => {
         delete process.env.MPP_SECRET_KEY;
         await expect(configure({ network: 'solana_devnet', operator: { signer } })).rejects.toThrow(ConfigurationError);
         process.env.MPP_SECRET_KEY = 'env-secret';
-        const config = await configure({ network: 'solana_devnet', operator: { signer } });
+        const config = await configure({ network: 'solana_devnet', operator: { signer }, replayStore: SHARED_STORE });
         expect(config.mpp.challengeBindingSecret).toBe('env-secret');
         delete process.env.MPP_SECRET_KEY;
+    });
+
+    it('requires an injected replay store outside localnet', async () => {
+        const signer = await Signer.generate();
+        await expect(configure({
+            ...SECRET,
+            mpp: { challengeBindingSecret: 'test-secret' },
+            network: 'solana_devnet',
+            operator: { signer },
+        })).rejects.toThrow(
+            /atomic shared replayStore/,
+        );
+
+        await expect(configure({ mpp: { challengeBindingSecret: 'test-secret' } })).rejects.toThrow(
+            /atomic shared replayStore/,
+        );
+
+        const local = await configure(SECRET);
+        expect(local.replayStore).toBeDefined();
+
+        const production = await configure({
+            ...SECRET,
+            network: 'solana_devnet',
+            operator: { signer },
+            replayStore: SHARED_STORE,
+        });
+        expect(production.replayStore).toBe(SHARED_STORE);
     });
 
     it('configures from prefixed environment variables', async () => {
@@ -63,7 +125,7 @@ describe('configure', () => {
         process.env.PAY_KIT_STABLECOINS = '';
         process.env.PAY_KIT_RPC_URL = 'http://rpc.example';
         try {
-            const config = await configureFromEnv();
+            const config = await configureFromEnv('PAY_KIT_', SHARED_STORE);
             expect(config.network).toBe('solana_devnet');
             expect(config.mpp.challengeBindingSecret).toBe('env-secret');
             expect(config.mpp.expiresIn).toBe(60);

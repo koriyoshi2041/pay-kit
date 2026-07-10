@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/bits"
 	"os"
 	"strings"
@@ -70,8 +71,14 @@ type Config struct {
 	Realm          string
 	HTML           bool
 	FeePayerSigner solanatx.Signer
-	Store          core.Store
-	RPC            solanatx.RPCClient
+	// Store persists consumed charge credentials. Construction requires an
+	// implementation that affirmatively implements SharedStore on every network.
+	Store core.Store
+	RPC   solanatx.RPCClient
+	// AllowUnsafeMemoryStore is an explicit development/test escape hatch.
+	// It permits a process-local store on any network and defaults to false.
+	// Never enable it in a multi-instance deployment.
+	AllowUnsafeMemoryStore bool
 
 	// AcceptPushMode opts in to accepting type="signature" (push mode)
 	// credentials, where the client broadcasts the transaction itself and
@@ -155,6 +162,19 @@ func New(config Config) (*Mpp, error) {
 		return nil, core.WrapError(core.ErrCodeInvalidConfig, "invalid network", err)
 	}
 	config.Network = string(canonicalNetwork)
+	if config.Store == nil && config.AllowUnsafeMemoryStore {
+		log.Printf("pay-kit: WARNING: MPP server on %s explicitly enabled process-local MemoryStore; replay markers are lost on restart and are not shared across workers", config.Network)
+		config.Store = core.NewMemoryStore()
+	}
+	if config.Store == nil {
+		return nil, core.NewError(core.ErrCodeInvalidConfig,
+			fmt.Sprintf("an atomic shared replay store is required on %s; inject Config.Store or explicitly enable AllowUnsafeMemoryStore for development", config.Network))
+	}
+	shared, sharedOK := config.Store.(core.SharedStore)
+	if (!sharedOK || !shared.IsShared()) && !config.AllowUnsafeMemoryStore {
+		return nil, core.NewError(core.ErrCodeInvalidConfig,
+			fmt.Sprintf("an atomic shared replay store is required on %s; Store must implement SharedStore and report IsShared() == true", config.Network))
+	}
 	// Derive a per-recipient default realm when none is configured (and reject
 	// an explicitly-empty realm). A shared literal default would let two
 	// servers sharing MPP_SECRET_KEY participate in one credential namespace.
@@ -167,9 +187,6 @@ func New(config Config) (*Mpp, error) {
 	}
 	if config.RPC == nil {
 		config.RPC = rpc.New(rpcURL)
-	}
-	if config.Store == nil {
-		config.Store = core.NewMemoryStore()
 	}
 	// Resolve the token program once at boot. Known stablecoins answer from
 	// the static table; an arbitrary mint address is looked up on-chain and

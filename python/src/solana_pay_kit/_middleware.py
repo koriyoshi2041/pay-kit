@@ -35,6 +35,7 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 from solana_pay_kit._paycore.protocol import Protocol
+from solana_pay_kit._paycore.store import Store
 from solana_pay_kit.errors import (
     InvalidProofError,
     PaymentRequiredError,
@@ -91,22 +92,35 @@ class PayCore:
         config: Config,
         *,
         mpp: MppAdapter | None = None,
+        mpp_replay_store: Store | None = None,
         x402: X402Adapter | None = None,
+        x402_replay_store: Store | None = None,
     ) -> None:
         """Bind to ``config`` and resolve (or inject) the scheme adapters."""
         self._config = config
-        self._mpp = mpp if mpp is not None else MppAdapter(config)
+        if mpp is not None:
+            self._mpp: MppAdapter | None = mpp
+        elif Protocol.MPP in config.accept:
+            self._mpp = MppAdapter(config, replay_store=mpp_replay_store)
+        else:
+            self._mpp = None
         # Auto-wire the x402 adapter only when the config accept list includes
         # it; mirrors the PHP constructor. An explicit adapter always wins.
         if x402 is not None:
             self._x402: X402Adapter | None = x402
         elif Protocol.X402 in config.accept:
-            self._x402 = X402Adapter(config)
+            self._x402 = X402Adapter(config, replay_store=x402_replay_store)
         else:
             self._x402 = None
 
     @classmethod
-    def for_config(cls, config: Config) -> PayCore:
+    def for_config(
+        cls,
+        config: Config,
+        *,
+        mpp_replay_store: Store | None = None,
+        x402_replay_store: Store | None = None,
+    ) -> PayCore:
         """Return the cached per-Config core, building (and caching) one on miss.
 
         The framework shims call this once per request; reusing one core per
@@ -117,8 +131,24 @@ class PayCore:
         """
         cached = _CORE_CACHE.get(config)
         if cached is not None:
+            if (
+                mpp_replay_store is not None
+                and cached._mpp is not None
+                and cached._mpp.replay_store is not mpp_replay_store
+            ):
+                raise RuntimeError("PayCore.for_config received a different MPP replay store for a cached Config")
+            if (
+                x402_replay_store is not None
+                and cached._x402 is not None
+                and cached._x402._store is not x402_replay_store  # pyright: ignore[reportPrivateUsage]
+            ):
+                raise RuntimeError("PayCore.for_config received a different x402 replay store for a cached Config")
             return cached
-        core = cls(config)
+        core = cls(
+            config,
+            mpp_replay_store=mpp_replay_store,
+            x402_replay_store=x402_replay_store,
+        )
         _CORE_CACHE[config] = core
         return core
 
@@ -214,7 +244,7 @@ class PayCore:
         if self._x402 is not None and Protocol.X402 in accept and not gate.has_fees():
             accepts.append(self._x402.accepts_entry(gate, request))
             headers.update(self._x402.challenge_headers(gate, request))
-        if Protocol.MPP in accept:
+        if Protocol.MPP in accept and self._mpp is not None:
             accepts.append(self._mpp.accepts_entry(gate, request))
             headers.update(self._mpp.challenge_headers(gate, request))
 

@@ -11,6 +11,7 @@ import pytest
 
 import solana_pay_kit._middleware as mw
 from solana_pay_kit import Config, MppConfig, Network, Payment, Price, Protocol, Stablecoin, X402Config, configure
+from solana_pay_kit._paycore.store import FileReplayStore
 from solana_pay_kit.config import config as get_config
 from solana_pay_kit.config import reset
 from solana_pay_kit.errors import PaymentRequiredError
@@ -33,7 +34,7 @@ def _clean(monkeypatch: pytest.MonkeyPatch):
         network="solana_localnet",
         preflight=False,
         accept=(Protocol.MPP,),
-        mpp=MppConfig(challenge_binding_secret=SECRET),
+        mpp=MppConfig(challenge_binding_secret=SECRET, allow_unsafe_memory_store=True),
     )
     yield
     reset()
@@ -66,6 +67,70 @@ def _patch_process(monkeypatch: pytest.MonkeyPatch, *, paid: bool) -> list[str]:
 
     monkeypatch.setattr(mw.PayCore, "process", fake_process)
     return calls
+
+
+def test_fastapi_production_boot_accepts_injected_shared_replay_store(tmp_path) -> None:
+    reset()
+    cfg = configure(
+        network="solana_devnet",
+        preflight=False,
+        accept=(Protocol.MPP,),
+        mpp=MppConfig(challenge_binding_secret=SECRET),
+    )
+    store = FileReplayStore(tmp_path / "fastapi-replay.json")
+    app = FastAPI()
+    pk_fastapi.install_paywall_from_config(
+        app,
+        pk_fastapi.PaywallConfig(
+            gate_ref=Price.usd("0.10", Stablecoin.USDC),
+            default_policy="public",
+            config=cfg,
+            mpp_replay_store=store,
+        ),
+        cors_origins=None,
+    )
+    assert mw.PayCore.for_config(cfg, mpp_replay_store=store)._mpp is not None
+
+
+def test_fastapi_x402_only_production_request_does_not_construct_mpp(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reset()
+    monkeypatch.setattr(mw.X402Adapter, "_fetch_recent_blockhash", lambda _self: None)
+    cfg = configure(
+        network="solana_devnet",
+        preflight=False,
+        accept=(Protocol.X402,),
+        x402=X402Config(),
+    )
+    store = FileReplayStore(tmp_path / "fastapi-x402-replay.json")
+    app = FastAPI()
+    pk_fastapi.install_paywall_from_config(
+        app,
+        pk_fastapi.PaywallConfig(
+            gate_ref=Price.usd("0.10", Stablecoin.USDC),
+            config=cfg,
+            default_policy="paid",
+            x402_replay_store=store,
+        ),
+        cors_origins=None,
+    )
+
+    @app.get("/paid")
+    async def paid() -> dict[str, bool]:
+        return {"ok": True}
+
+    response = TestClient(app, raise_server_exceptions=False).get("/paid")
+    assert response.status_code == 402
+    assert response.headers.get("payment-required") is not None
+    assert response.headers.get("www-authenticate") is None
+    assert response.json()["accepts"][0]["protocol"] == "x402"
+
+    core = mw.PayCore.for_config(cfg, x402_replay_store=store)
+    assert core._mpp is None
+    assert core._x402 is not None
+    assert core._x402._store is store
 
 
 def test_paywall_default_public_gates_only_marked_routes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -333,7 +398,7 @@ def test_install_paywall_preserves_global_config_subconfigs(monkeypatch: pytest.
         network=Network.SOLANA_DEVNET,
         preflight=False,
         accept=(Protocol.MPP,),
-        mpp=MppConfig(challenge_binding_secret=SECRET),
+        mpp=MppConfig(challenge_binding_secret=SECRET, allow_unsafe_memory_store=True),
         x402=X402Config(facilitator_url="https://facilitator.example"),
     )
     app = FastAPI()

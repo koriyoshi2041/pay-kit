@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace PayKit\Protocols\Mpp;
 
 use PayKit\Config;
+use PayKit\Exception\ConfigurationException;
 use PayKit\Exception\InvalidProofException;
 use PayKit\Gate;
 use PayKit\Payment;
@@ -17,6 +18,7 @@ use PayKit\Protocols\Mpp\Server\PaymentRequiredResponse;
 use PayKit\Protocols\Mpp\Server\SolanaChargeHandler;
 use PayKit\Store\MemoryStore;
 use PayKit\Store\Store;
+use PayKit\Store\DurableStore;
 use Psr\Http\Message\ServerRequestInterface;
 use SolanaPhpSdk\Keypair\Keypair;
 use SolanaPhpSdk\Rpc\RpcClient;
@@ -40,24 +42,38 @@ final class Adapter
 
     /**
      * @param ?Store $replayStore Replay-protection store shared across every
-     *        {@see SolanaChargeHandler} this adapter builds. When null (the
-     *        default) an in-process {@see MemoryStore} is used and a loud
-     *        dev-only warning is emitted: a single-process memory store
-     *        loses replay protection across workers/restarts, so production
-     *        deployments MUST inject a shared atomic store (Redis, Postgres).
+     *        {@see SolanaChargeHandler} this adapter builds. Null falls back
+     *        to a warned in-process {@see MemoryStore} on localnet only.
+     *        Non-local deployments MUST inject a shared atomic store (Redis,
+     *        Postgres); missing or explicit MemoryStore configuration fails
+     *        construction.
      */
     public function __construct(
         private readonly Config $config,
         ?Store $replayStore = null,
     ) {
-        if ($replayStore === null) {
+        $replayStore ??= $config->mpp->replayStore;
+        if ($replayStore === null && $config->mpp->allowUnsafeMemoryStore) {
             if (function_exists('error_log')) {
                 error_log(
-                    'pay_kit: WARN: mpp adapter using in-memory replay store; '
-                    . 'dev-only. Inject a shared atomic Store (Redis/Postgres) in production.',
+                    'pay_kit: WARN: MPP explicitly enabled a process-local replay store; '
+                    . 'markers are lost on restart and are not shared across workers.',
                 );
             }
             $replayStore = new MemoryStore();
+        }
+        if ($replayStore === null) {
+            throw new ConfigurationException(
+                'pay_kit: MPP requires an injected atomic durable/shared replay store; '
+                . 'allowUnsafeMemoryStore is development-only',
+            );
+        }
+        if (!$config->mpp->allowUnsafeMemoryStore
+            && (!$replayStore instanceof DurableStore || !$replayStore->isDurable())) {
+            throw new ConfigurationException(
+                'pay_kit: MPP replay store does not affirm durable/shared capability; '
+                . 'implement DurableStore::isDurable() and return true',
+            );
         }
         $this->replayStore = $replayStore;
     }
@@ -231,6 +247,7 @@ final class Adapter
             network: $this->config->network->mintsLabel(),
             replayStore: $this->replayStore,
             acceptPushMode: $this->config->mpp->acceptPushMode,
+            allowUnsafeMemoryStore: $this->config->mpp->allowUnsafeMemoryStore,
         );
         $this->handlerCache[$key] = [$charges, $handler];
         return $this->handlerCache[$key];

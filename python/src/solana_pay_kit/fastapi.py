@@ -41,6 +41,7 @@ import weakref
 from starlette.routing import Match
 
 from solana_pay_kit._middleware import PAYMENT_ATTR, PayCore, payment
+from solana_pay_kit._paycore.store import Store
 from solana_pay_kit.config import config as _config
 from solana_pay_kit.errors import InvalidProofError, PayKitError, PaymentRequiredError
 from solana_pay_kit.payment import Payment
@@ -138,6 +139,8 @@ class PaywallConfig:
     gate_ref: Gate | DynamicGate | Price | str | Callable[[Request], Gate] | None = None
     pricing: Pricing | None = None
     config: Config | None = None
+    mpp_replay_store: Store | None = None
+    x402_replay_store: Store | None = None
     default_policy: PaywallDefaultPolicy = "public"
     paid_tags: tuple[str, ...] = ("paid", "pay")
     public_tags: tuple[str, ...] = ("public", "free")
@@ -182,6 +185,7 @@ def RequirePayment(  # noqa: N802 - factory reads as a dependency constructor
     *,
     pricing: Pricing | None = None,
     config: Config | None = None,
+    mpp_replay_store: Store | None = None,
 ) -> Callable[..., Any]:
     """Build a FastAPI dependency that gates a route behind ``gate_ref``.
 
@@ -193,7 +197,10 @@ def RequirePayment(  # noqa: N802 - factory reads as a dependency constructor
     """
 
     async def dependency(request: Request) -> Payment:
-        core = PayCore.for_config(config if config is not None else _config())
+        core = PayCore.for_config(
+            config if config is not None else _config(),
+            mpp_replay_store=mpp_replay_store,
+        )
         try:
             payment = await core.process(gate_ref, pricing, request)
         except PaymentRequiredError as exc:
@@ -324,6 +331,8 @@ def install_paywall_from_config(
     paywall: PaywallConfig,
     *,
     cors_origins: Sequence[str] | None = ("*",),
+    mpp_replay_store: Store | None = None,
+    x402_replay_store: Store | None = None,
 ) -> None:
     """Install a Django/DRF-style paywall over an existing FastAPI app.
 
@@ -355,7 +364,11 @@ def install_paywall_from_config(
             )
         pricing = requirement.pricing if requirement.pricing is not None else paywall.pricing
         config = requirement.config if requirement.config is not None else paywall.config
-        core = PayCore.for_config(config if config is not None else _config())
+        core = PayCore.for_config(
+            config if config is not None else _config(),
+            mpp_replay_store=mpp_replay_store or paywall.mpp_replay_store,
+            x402_replay_store=x402_replay_store or paywall.x402_replay_store,
+        )
 
         try:
             verified = await core.process(gate_ref, pricing, request)
@@ -396,6 +409,7 @@ def install_paywall(
     paid_tags: tuple[str, ...] = ("paid", "pay"),
     public_tags: tuple[str, ...] = ("public", "free"),
     cors_origins: Sequence[str] | None = ("*",),
+    mpp_replay_store: Store | None = None,
 ) -> None:
     """Install a route-metadata paywall from app-level Pay settings.
 
@@ -413,11 +427,13 @@ def install_paywall(
         PaywallConfig(
             gate_ref=pay_config.gate_ref(),
             config=pay_config.build_config(preserve_global=True),
+            mpp_replay_store=mpp_replay_store,
             default_policy=default_policy,
             paid_tags=paid_tags,
             public_tags=public_tags,
         ),
         cors_origins=cors_origins,
+        mpp_replay_store=mpp_replay_store,
     )
 
 

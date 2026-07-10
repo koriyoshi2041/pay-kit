@@ -12,6 +12,13 @@ use std::pin::Pin;
 
 /// Async key-value store interface.
 pub trait Store: Send + Sync {
+    /// Whether this implementation is atomic and shared across all server
+    /// instances that can accept the same credential. Unknown stores default
+    /// to false and are rejected by production charge construction.
+    fn is_shared(&self) -> bool {
+        false
+    }
+
     fn get(
         &self,
         key: &str,

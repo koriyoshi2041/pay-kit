@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import pytest
 
-from solana_pay_kit import Gate, MppConfig, Price, Protocol, Stablecoin, configure
+from solana_pay_kit import Gate, MppConfig, Operator, Price, Protocol, Signer, Stablecoin, configure
+from solana_pay_kit._middleware import PayCore
+from solana_pay_kit._paycore.store import FileReplayStore, MemoryStore
 from solana_pay_kit.config import reset
-from solana_pay_kit.errors import InvalidProofError
+from solana_pay_kit.errors import ConfigurationError, InvalidProofError
 from solana_pay_kit.protocols.mpp import MppAdapter, SecretResolver
 from solana_pay_kit.protocols.mpp.core.headers import format_authorization
 from solana_pay_kit.protocols.mpp.core.types import ChallengeEcho, PaymentCredential
@@ -31,9 +33,11 @@ def _clean(monkeypatch):
 
 def _cfg(**kw):
     kw.setdefault("network", "solana_localnet")
+    if kw["network"] == "solana_mainnet":
+        kw.setdefault("operator", Operator(signer=Signer.generate()))
     kw.setdefault("preflight", False)
     kw.setdefault("accept", (Protocol.MPP,))
-    kw.setdefault("mpp", MppConfig(challenge_binding_secret=SECRET))
+    kw.setdefault("mpp", MppConfig(challenge_binding_secret=SECRET, allow_unsafe_memory_store=True))
     return configure(**kw)
 
 
@@ -67,6 +71,52 @@ def _credential_for(adapter: MppAdapter, gate: Gate) -> str:
         payload={"type": "signature", "signature": "5UfDuX6nSqMzMR8W7n6K3b1GKLmaqEisBFCcYPRLjNHrCbVQJF3BVjkE7aQJMQ2Kx"},
     )
     return format_authorization(cred)
+
+
+# -- replay-store construction ---------------------------------------------
+
+
+@pytest.mark.parametrize("network", ["solana_devnet", "solana_mainnet"])
+def test_non_localnet_requires_injected_replay_store(network):
+    cfg = _cfg(network=network, mpp=MppConfig(challenge_binding_secret=SECRET))
+    with pytest.raises(ConfigurationError, match="atomic shared replay_store"):
+        MppAdapter(cfg)
+
+
+def test_non_localnet_rejects_memory_store():
+    cfg = _cfg(network="solana_mainnet", mpp=MppConfig(challenge_binding_secret=SECRET))
+    with pytest.raises(ConfigurationError, match="is_shared=True"):
+        MppAdapter(cfg, replay_store=MemoryStore())
+
+
+def test_localnet_requires_explicit_unsafe_flag_for_memory_store():
+    cfg = _cfg(mpp=MppConfig(challenge_binding_secret=SECRET))
+    store = MemoryStore()
+    with pytest.raises(ConfigurationError, match="is_shared=True"):
+        MppAdapter(cfg, replay_store=store)
+
+    cfg = _cfg()
+    adapter = MppAdapter(cfg, replay_store=store)
+    assert adapter._replay_store is store
+
+
+def test_non_localnet_allows_injected_durable_store(tmp_path):
+    cfg = _cfg(network="solana_mainnet")
+    store = FileReplayStore(tmp_path / "mpp-replay.json")
+    adapter = MppAdapter(cfg, replay_store=store)
+    assert adapter._replay_store is store
+
+
+def test_non_localnet_uses_store_from_mpp_config(tmp_path):
+    store = FileReplayStore(tmp_path / "configured-mpp-replay.json")
+    cfg = _cfg(
+        network="solana_mainnet",
+        mpp=MppConfig(challenge_binding_secret=SECRET, replay_store=store),
+    )
+    adapter = MppAdapter(cfg)
+    assert adapter._replay_store is store
+    core = PayCore.for_config(cfg)
+    assert core._mpp._replay_store is store
 
 
 # -- offer / challenge -------------------------------------------------------
@@ -164,7 +214,7 @@ def test_charge_options_expiry_derived_from_config():
     wire layer's hard-coded 5-minute fallback."""
     from datetime import UTC, datetime
 
-    cfg = _cfg(mpp=MppConfig(challenge_binding_secret=SECRET, expires_in=30))
+    cfg = _cfg(mpp=MppConfig(challenge_binding_secret=SECRET, expires_in=30, allow_unsafe_memory_store=True))
     adapter = MppAdapter(cfg)
     gate = _gate(cfg)
 
@@ -331,7 +381,7 @@ def test_adapter_resolves_secret_from_resolver_when_unconfigured(monkeypatch, tm
         network="solana_localnet",
         preflight=False,
         accept=(Protocol.MPP,),
-        mpp=MppConfig(),  # no secret set
+        mpp=MppConfig(allow_unsafe_memory_store=True),  # no secret set
     )
     adapter = MppAdapter(cfg)
     assert adapter._secret == "adapter-env-secret"

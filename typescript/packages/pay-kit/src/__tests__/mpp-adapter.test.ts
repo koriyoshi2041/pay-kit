@@ -1,18 +1,20 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { createMppAdapter } from '../adapters/mpp.js';
 import { configure } from '../config.js';
 import { Gate } from '../gate.js';
 import { usd } from '../price.js';
 import { Signer } from '../signer.js';
+import { createUnsafeMemoryReplayStore } from '../replay-store.js';
 
 const SELLER = 'AyNAa2VPe2t5pgg8M61iE6kqMudkV98zsT4rkAZuU6tj';
 const PLATFORM = 'CXG3Pq3DwZb1HVckhPQbVxiwoNGM3jNGYvC2BSdkj1pK';
 
 async function setup() {
     const config = await configure({
-        mpp: { challengeBindingSecret: 'adapter-test-secret', realm: 'Adapter test' },
+        mpp: { challengeBindingSecret: 'adapter-test-secret', realm: 'Adapter test', allowUnsafeMemoryStore: true },
         operator: { recipient: SELLER, signer: await Signer.generate() },
+        replayStore: createUnsafeMemoryReplayStore(),
     });
     return { adapter: createMppAdapter(config), config };
 }
@@ -25,6 +27,26 @@ function gate(params: Parameters<typeof Gate.create>[0]['feeWithin'] = undefined
 }
 
 describe('createMppAdapter', () => {
+    it('rejects a hand-built non-local config without a replay store', async () => {
+        const { config } = await setup();
+        expect(() => createMppAdapter({ ...config, network: 'solana_devnet', replayStore: undefined })).toThrow(
+            /replayStore resolved by configure/,
+        );
+    });
+
+    it('requires an explicit unsafe flag before allocating a process-local store', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        try {
+            await configure({
+                mpp: { challengeBindingSecret: 'adapter-test-secret', allowUnsafeMemoryStore: true },
+                operator: { recipient: SELLER, signer: await Signer.generate() },
+            });
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining('process-local replay store'));
+        } finally {
+            warn.mockRestore();
+        }
+    });
+
     it('detects MPP payment credentials', async () => {
         const { adapter } = await setup();
         expect(adapter.detect(new Request('http://t/', { headers: { authorization: 'Payment abc' } }))).toBe(true);

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace PayKit\Protocols\Mpp\Server;
 
 use InvalidArgumentException;
+use PayKit\Exception\ConfigurationException;
 use RuntimeException;
 use Throwable;
 use PayKit\PayCore\Rpc\RpcGateway;
@@ -13,6 +14,7 @@ use PayKit\Protocols\Mpp\Core\Credential;
 use PayKit\Protocols\Mpp\Intent\ChargeRequest;
 use PayKit\Store\MemoryStore;
 use PayKit\Store\Store;
+use PayKit\Store\DurableStore;
 use SolanaPhpSdk\Keypair\Keypair;
 use SolanaPhpSdk\Rpc\RpcClient;
 use SolanaPhpSdk\Transaction\Transaction;
@@ -66,10 +68,9 @@ final class SolanaChargeHandler
      *        `getSignatureStatuses` before giving up. 40 attempts at the
      *        default delay = 10 seconds.
      * @param int $confirmationDelayMicros Sleep between polls in microseconds.
-     * @param ?Store $replayStore Replay-protection store. Defaults to an
-     *        in-process {@see MemoryStore}; production deployments should
-     *        inject a shared atomic store (Redis, Postgres) so replay
-     *        protection survives restarts and worker pools.
+     * @param ?Store $replayStore Atomic shared replay-protection store.
+     *        Process-local memory is available only with the separate unsafe
+     *        development flag; localnet alone never opts in.
      */
     private readonly RpcGateway $rpc;
 
@@ -85,6 +86,7 @@ final class SolanaChargeHandler
         private readonly int $confirmationDelayMicros = 250_000,
         ?Store $replayStore = null,
         bool $acceptPushMode = false,
+        bool $allowUnsafeMemoryStore = false,
     ) {
         $this->rpc = $rpc instanceof RpcGateway ? $rpc : new SolanaRpcGateway($rpc);
         // Push mode (§13.5) is off by default; the default verifier is built
@@ -93,7 +95,29 @@ final class SolanaChargeHandler
         $this->verifier = $verifier ?? new SolanaChargeTransactionVerifier(acceptPushMode: $acceptPushMode);
         $this->transactionVerifier = $transactionVerifier
             ?? ($this->verifier instanceof TransactionPayloadVerifier ? $this->verifier : new SolanaChargeTransactionVerifier(acceptPushMode: $acceptPushMode));
-        $this->replayStore = $replayStore ?? new MemoryStore();
+        if ($replayStore === null && $allowUnsafeMemoryStore) {
+            if (function_exists('error_log')) {
+                error_log(
+                    'pay_kit: WARN: MPP explicitly enabled a process-local replay store; '
+                    . 'markers are lost on restart and are not shared across workers.',
+                );
+            }
+            $replayStore = new MemoryStore();
+        }
+        if ($replayStore === null) {
+            throw new ConfigurationException(
+                'pay_kit: MPP requires an injected atomic durable/shared replay store; '
+                . 'allowUnsafeMemoryStore is development-only',
+            );
+        }
+        if (!$allowUnsafeMemoryStore
+            && (!$replayStore instanceof DurableStore || !$replayStore->isDurable())) {
+            throw new ConfigurationException(
+                'pay_kit: MPP replay store does not affirm durable/shared capability; '
+                . 'implement DurableStore::isDurable() and return true',
+            );
+        }
+        $this->replayStore = $replayStore;
     }
 
     /**

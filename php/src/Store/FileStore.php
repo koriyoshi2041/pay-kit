@@ -18,8 +18,13 @@ use RuntimeException;
  * arbitrary key strings (including ones containing path separators) without
  * worrying about filesystem-safe encodings.
  */
-final class FileStore implements Store
+final class FileStore implements DurableStore
 {
+    public function isDurable(): bool
+    {
+        return true;
+    }
+
     public function __construct(private readonly string $directory)
     {
         if (!is_dir($this->directory) && !mkdir($this->directory, 0700, true) && !is_dir($this->directory)) {

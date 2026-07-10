@@ -45,7 +45,7 @@ function fakeAdapter(config: PayKitConfig): ProtocolAdapter {
 }
 
 async function setup() {
-    const config = await configure({ mpp: { challengeBindingSecret: 's3cret' } });
+    const config = await configure({ mpp: { challengeBindingSecret: 's3cret', allowUnsafeMemoryStore: true } });
     return createPayKit({
         adapters: [fakeAdapter(config)],
         config,
@@ -111,7 +111,9 @@ describe('createPayKit', () => {
     });
 
     it('serves a protocol-owned response for browser/worker requests, JSON 402 for API', async () => {
-        const config = await configure({ mpp: { challengeBindingSecret: 's3cret', html: true } });
+        const config = await configure({
+            mpp: { challengeBindingSecret: 's3cret', html: true, allowUnsafeMemoryStore: true },
+        });
         const htmlAdapter: ProtocolAdapter = {
             ...fakeAdapter(config),
             async respond(_gate, request) {
@@ -180,7 +182,7 @@ describe('createPayKit', () => {
     });
 
     it('requires a pricing catalogue for name references', async () => {
-        const config = await configure({ mpp: { challengeBindingSecret: 's3cret' } });
+        const config = await configure({ mpp: { challengeBindingSecret: 's3cret', allowUnsafeMemoryStore: true } });
         const paykit = await createPayKit({ adapters: [fakeAdapter(config)], config });
         await expect(paykit.requirePayment(new Request('http://api.test/x'), 'report')).rejects.toThrow(
             ConfigurationError,
