@@ -39,7 +39,7 @@ import random
 from fastapi import Depends, FastAPI, Request
 
 import solana_pay_kit
-from solana_pay_kit import Gate, Pricing, usd
+from solana_pay_kit import Gate, MppConfig, Network, Pricing, usd
 from solana_pay_kit._paycore.protocol import Protocol
 from solana_pay_kit.fastapi import Charge, Payment, RequirePayment, RequireUsage, install
 
@@ -47,11 +47,15 @@ from . import discovery
 from .docs import register_docs
 from .sandbox import fund_sandbox, fund_usdc, register_faucet
 
+_network = Network(os.getenv("PAY_KIT_NETWORK", Network.SOLANA_LOCALNET.value))
 solana_pay_kit.configure(
-    network=os.getenv("PAY_KIT_NETWORK", "solana_localnet"),
+    network=_network,
     # Point at a specific Solana RPC (e.g. a local surfnet) when set; otherwise
     # the network default is used. Mirrors the TS playground's RPC_URL knob.
     rpc_url=os.getenv("PAY_KIT_RPC_URL") or None,
+    # This example intentionally uses a process-local store for local
+    # development. Non-localnet deployments retain the fail-closed default.
+    mpp=MppConfig(allow_unsafe_memory_store=_network is Network.SOLANA_LOCALNET),
 )
 
 # Imported after configure() so the session method builds from the resolved
