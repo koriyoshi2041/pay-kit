@@ -12,6 +12,10 @@ from solana_pay_kit.errors import ConfigurationError
 from solana_pay_kit.protocols.x402 import X402Adapter
 
 
+class _SharedMemoryStore(MemoryStore):
+    is_shared = True
+
+
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch: pytest.MonkeyPatch):
     reset()
@@ -42,7 +46,7 @@ def test_nonlocalnet_without_shared_replay_store_rejects(network: Network):
 
 @pytest.mark.asyncio
 async def test_nonlocalnet_accepts_injected_atomic_store():
-    store = MemoryStore()
+    store = _SharedMemoryStore()
     adapter = X402Adapter(_config(Network.SOLANA_DEVNET), replay_store=store)
 
     assert adapter._store is store
