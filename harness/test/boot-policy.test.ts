@@ -447,7 +447,7 @@ const sourceContractProbes: SourceContractProbe[] = [
         file: "ruby/lib/pay_kit/protocols/mpp/runtime.rb",
         mechanism: "rejects supplied stores that do not explicitly report durability",
         pattern:
-          /unless localnet\?\(method\) \|\| durable_replay_store\?\(replay_store\)[\s\S]*?requires a durable replay_store/,
+          /unless localnet\?\(method\) \|\| durable_(?:shared_)?replay_store\?\(replay_store\)[\s\S]*?requires a durable replay_store/,
       },
       {
         file: "ruby/lib/pay_kit/protocols/mpp/runtime.rb",
