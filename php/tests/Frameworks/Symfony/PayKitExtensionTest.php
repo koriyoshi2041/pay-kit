@@ -6,20 +6,38 @@ namespace PayKit\Tests\Frameworks\Symfony;
 
 use PayKit\Frameworks\Symfony\DependencyInjection\PayKitExtension;
 use PayKit\Protocols\Mpp\Adapter;
-use PayKit\Store\FileStore;
+use PayKit\Store\ReplayStoreCapability;
+use PayKit\Store\Store;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Reference;
+
+final class SymfonySharedReplayStore implements Store, ReplayStoreCapability
+{
+    /** @var array<string, mixed> */
+    private array $values = [];
+
+    public function putIfAbsent(string $key, mixed $value): bool
+    {
+        if (array_key_exists($key, $this->values)) {
+            return false;
+        }
+        $this->values[$key] = $value;
+        return true;
+    }
+
+    public function providesDurableSharedReplayProtection(): bool
+    {
+        return true;
+    }
+}
 
 final class PayKitExtensionTest extends TestCase
 {
     public function testProductionMppBootWiresConfiguredReplayStoreService(): void
     {
         $container = new ContainerBuilder();
-        $directory = sys_get_temp_dir() . '/pay-kit-symfony-' . bin2hex(random_bytes(8));
-        $container->register('app.mpp_replay_store', FileStore::class)
-            ->setArgument('$directory', $directory)
-            ->setPublic(true);
+        $container->register('app.mpp_replay_store', SymfonySharedReplayStore::class)->setPublic(true);
         $container->register('paykit.psr_http_factory', \stdClass::class)->setPublic(true);
         $container->register('paykit.http_foundation_factory', \stdClass::class)->setPublic(true);
         (new PayKitExtension())->load([[
