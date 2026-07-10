@@ -43,6 +43,7 @@ final class PayKitExtensionTest extends TestCase
         (new PayKitExtension())->load([[
             'network' => 'solana_devnet',
             'accept' => ['x402'],
+            'preflight' => false,
         ]], $container);
 
         self::assertFalse($container->hasDefinition(Adapter::class));

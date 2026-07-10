@@ -5099,8 +5099,7 @@ mod tests {
         .err()
         .expect("process-local production replay store should fail");
         assert!(
-            err.to_string()
-                .contains("does not affirm shared capability"),
+            err.to_string().contains("atomic shared replay store"),
             "got: {err}"
         );
     }

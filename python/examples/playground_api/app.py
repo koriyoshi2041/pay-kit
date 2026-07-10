@@ -95,9 +95,9 @@ class Catalog(Pricing):
 catalog = Catalog()
 
 # Module-level dependency singletons (FastAPI resolves them per request).
-require_fortune = Depends(RequirePayment("fortune", pricing=catalog))
-require_quote = Depends(RequirePayment("quote", pricing=catalog))
-require_joke = Depends(RequirePayment("joke", pricing=catalog))
+require_fortune = Depends(RequirePayment("fortune", pricing=catalog, config=_cfg))
+require_quote = Depends(RequirePayment("quote", pricing=catalog, config=_cfg))
+require_joke = Depends(RequirePayment("joke", pricing=catalog, config=_cfg))
 
 # x402 `upto` usage gate (POST /api/v1/summarize): authorize up to $0.10 and bill
 # the tokens produced. Mirrors the TypeScript playground's summarize route.
@@ -108,7 +108,7 @@ summarize_gate = Gate.build(
     default_pay_to=_RECIPIENT,
     accept=(Protocol.X402,),
 )
-require_summarize = Depends(RequireUsage(summarize_gate))
+require_summarize = Depends(RequireUsage(summarize_gate, config=_cfg))
 
 #: Base units billed per summarized token (matches the TS playground).
 PRICE_PER_TOKEN = 100
