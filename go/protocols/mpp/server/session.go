@@ -26,10 +26,11 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"slices"
 	"strconv"
 	"time"
 
-	solana "github.com/gagliardetto/solana-go"
+	solana "github.com/solana-foundation/solana-go/v2"
 
 	"github.com/solana-foundation/pay-kit/go/protocols/mpp/intents"
 )
@@ -56,6 +57,12 @@ type Split struct {
 // a top-up that carries no open transaction); callers then fall back to the
 // payload's owner/payer fields.
 type SessionTxVerifier[P any] func(ctx context.Context, payload *P) (string, error)
+
+// TopUpTxVerifier verifies the confirmed top-up transaction against the
+// channel snapshot whose deposit is about to change. ProcessTopUp rechecks
+// that deposit inside its final atomic mutation, so a concurrent top-up cannot
+// turn a correctly verified delta into a larger unbacked cap.
+type TopUpTxVerifier func(ctx context.Context, payload *intents.TopUpPayload, currentDeposit uint64) error
 
 // SessionConfig is the server configuration for the session intent.
 type SessionConfig struct {
@@ -111,9 +118,10 @@ type SessionConfig struct {
 	// mode) before ProcessOpen persists channel state. See SessionTxVerifier.
 	VerifyOpenTx SessionTxVerifier[intents.OpenPayload]
 
-	// VerifyTopUpTx, when set, confirms the top-up transaction on-chain
-	// before ProcessTopUp raises the deposit. See SessionTxVerifier.
-	VerifyTopUpTx SessionTxVerifier[intents.TopUpPayload]
+	// VerifyTopUpTx, when set, verifies that the confirmed top-up instruction
+	// targets this channel and funds exactly the claimed deposit delta before
+	// ProcessTopUp raises the deposit.
+	VerifyTopUpTx TopUpTxVerifier
 }
 
 // DeliveryRequest is a request to reserve a metered delivery for client-side
@@ -164,12 +172,12 @@ func (s *SessionServer) Store() ChannelStore {
 }
 
 // BuildChallengeRequest builds the SessionRequest to embed in a 402
-// challenge. cap is the maximum this session will allow, clamped to
+// challenge. capValue is the maximum this session will allow, clamped to
 // SessionConfig.MaxCap. MinVoucherDelta is included only when positive,
 // Modes is omitted when push-only, and PullVoucherStrategy is included only
 // when pull is offered.
-func (s *SessionServer) BuildChallengeRequest(cap uint64) intents.SessionRequest {
-	effectiveCap := min(cap, s.config.MaxCap)
+func (s *SessionServer) BuildChallengeRequest(capValue uint64) intents.SessionRequest {
+	effectiveCap := min(capValue, s.config.MaxCap)
 	decimals := s.config.Decimals
 
 	request := intents.SessionRequest{
@@ -221,15 +229,16 @@ func (s *SessionServer) supportsMode(mode intents.SessionMode) bool {
 	if len(s.config.Modes) == 0 {
 		return mode == intents.SessionModePush
 	}
-	for _, supported := range s.config.Modes {
-		if supported == mode {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(s.config.Modes, mode)
 }
 
 // ProcessOpen processes an open action and persists the channel state.
+//
+// The HTTP method layer does not route through here: Session.handleOpen
+// intentionally reimplements this open invariant as a superset (transaction
+// verification and server-side broadcast, idle-close touch). The two are kept
+// in sync deliberately; do not collapse one into the other without preserving
+// that extra behavior.
 //
 // The channel is keyed by OpenPayload.SessionID (channelId first, then
 // tokenAccount for pull opens). Replayed opens are idempotent: when a channel
@@ -467,19 +476,32 @@ func (s *SessionServer) ProcessTopUp(ctx context.Context, payload *intents.TopUp
 		return ChannelState{}, fmt.Errorf("invalid newDeposit: %s", payload.NewDeposit)
 	}
 
-	// On-chain verification seam (same shape as ProcessOpen). A top-up never
-	// establishes the channel payer, so the returned payer is ignored.
+	// Fetch the deposit snapshot before external transaction verification. The
+	// final mutator below insists this value is unchanged, preventing a
+	// concurrent top-up from invalidating the verified delta between RPC fetch
+	// and persistence.
+	channelID := payload.ChannelID
+	current, err := s.store.GetChannel(ctx, channelID)
+	if err != nil {
+		return ChannelState{}, err
+	}
+	if current == nil {
+		return ChannelState{}, fmt.Errorf("channel %s not found", channelID)
+	}
+	verifiedDeposit := current.Deposit
 	if s.config.VerifyTopUpTx != nil {
-		if _, err := s.config.VerifyTopUpTx(ctx, payload); err != nil {
+		if err := s.config.VerifyTopUpTx(ctx, payload, verifiedDeposit); err != nil {
 			return ChannelState{}, fmt.Errorf("top-up tx verification failed: %w", err)
 		}
 	}
 
 	maxCap := s.config.MaxCap
-	channelID := payload.ChannelID
 	return s.store.UpdateChannel(ctx, channelID, func(current *ChannelState) (ChannelState, error) {
 		if current == nil {
 			return ChannelState{}, fmt.Errorf("channel %s not found", channelID)
+		}
+		if s.config.VerifyTopUpTx != nil && current.Deposit != verifiedDeposit {
+			return ChannelState{}, fmt.Errorf("channel %s deposit changed during top-up verification", channelID)
 		}
 		if current.Sealed {
 			return ChannelState{}, fmt.Errorf("channel %s is already sealed", channelID)
@@ -746,6 +768,12 @@ func findCommitted(deliveries []CommittedDelivery, deliveryID string) *Committed
 
 // ProcessClose processes a close action: atomically set close-pending and
 // accept a final voucher if provided.
+//
+// The HTTP method layer does not route through here: Session.handleClose
+// intentionally diverges, its close is re-drivable (a retry after a
+// settlement failure is allowed) and it settles on-chain, whereas ProcessClose
+// always rejects a second close and leaves settlement to the host. The
+// divergence is deliberate; keep both final-voucher checks in step.
 //
 // Once CloseRequestedAt is set, vouchers, deliveries, commits, and top-ups
 // are all rejected, and a second close is rejected with "close already

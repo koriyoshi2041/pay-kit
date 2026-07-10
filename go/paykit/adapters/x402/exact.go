@@ -12,11 +12,11 @@ import (
 	"time"
 
 	bin "github.com/gagliardetto/binary"
-	solana "github.com/gagliardetto/solana-go"
-	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/solana-foundation/pay-kit/go/paycore"
 	"github.com/solana-foundation/pay-kit/go/paykit"
 	proto "github.com/solana-foundation/pay-kit/go/protocols/x402"
+	solana "github.com/solana-foundation/solana-go/v2"
+	"github.com/solana-foundation/solana-go/v2/rpc"
 )
 
 type Adapter struct {
@@ -56,7 +56,7 @@ type AcceptsEntry struct {
 
 func (e AcceptsEntry) AcceptsProtocol() paykit.Protocol { return paykit.X402 }
 
-func (a *Adapter) AcceptsEntry(gate *paykit.Gate) paykit.AcceptsEntry {
+func (a *Adapter) AcceptsEntry(gate *paykit.Gate) (paykit.AcceptsEntry, error) {
 	coin := a.settlementCoin(gate)
 	label := a.cfg.Network.MintsLabel()
 	mint := paycore.ResolveMint(coin, label)
@@ -71,6 +71,9 @@ func (a *Adapter) AcceptsEntry(gate *paykit.Gate) paykit.AcceptsEntry {
 		TokenProgram: paycore.DefaultTokenProgramForCurrency(coin, label),
 		Memo:         gate.Desc,
 	}
+	// recentBlockhash is best-effort: a stale/absent blockhash still
+	// yields a payable challenge, so a lookup error is intentionally
+	// non-fatal here rather than propagated.
 	if bh, err := a.recentBlockhash(); err == nil && bh != "" {
 		extra.RecentBlockhash = bh
 	}
@@ -84,13 +87,16 @@ func (a *Adapter) AcceptsEntry(gate *paykit.Gate) paykit.AcceptsEntry {
 		PayTo:             string(payTo),
 		MaxTimeoutSeconds: proto.DefaultMaxTimeoutSeconds,
 		Extra:             extra,
-	}}
+	}}, nil
 }
 
-func (a *Adapter) ChallengeHeaders(gate *paykit.Gate) map[string]string {
-	entry := a.AcceptsEntry(gate)
+func (a *Adapter) ChallengeHeaders(gate *paykit.Gate) (map[string]string, error) {
+	entry, err := a.AcceptsEntry(gate)
+	if err != nil {
+		return nil, err
+	}
 	accepts := []paykit.AcceptsEntry{entry}
-	envelope := map[string]interface{}{
+	envelope := map[string]any{
 		"x402Version": proto.X402Version,
 		"resource":    map[string]string{"type": "http", "url": gate.Desc},
 		"accepts":     accepts,
@@ -100,11 +106,11 @@ func (a *Adapter) ChallengeHeaders(gate *paykit.Gate) map[string]string {
 	}
 	raw, err := json.Marshal(envelope)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("protocols/x402: marshal payment-required envelope: %w", err)
 	}
 	return map[string]string{
 		proto.PaymentRequiredHeader: base64.StdEncoding.EncodeToString(raw),
-	}
+	}, nil
 }
 
 func (a *Adapter) advertisedExtensions() json.RawMessage {
@@ -364,7 +370,9 @@ func (a *Adapter) transferRequirements(gate *paykit.Gate) (proto.TransferRequire
 		Mint:         mint,
 		TokenProgram: tokenProgram,
 		Amount:       amount,
-		FeePayer:     feePayer,
+		ManagedSigners: []solana.PublicKey{
+			feePayer,
+		},
 		ExpectedMemo: gate.Desc,
 	}, nil
 }
@@ -374,14 +382,10 @@ func (a *Adapter) cosign(ctx context.Context, tx *solana.Transaction, rawTx []by
 	if err != nil {
 		return nil, fmt.Errorf("operator pubkey: %w", err)
 	}
-	cosignIdx := -1
-	for i, key := range tx.Message.AccountKeys {
-		if key.Equals(operator) && i < len(tx.Signatures) && tx.Signatures[i].IsZero() {
-			cosignIdx = i
-			break
-		}
-	}
-	if cosignIdx < 0 {
+	// The fee payer is the canonical first required signer and therefore owns
+	// signature slot 0. Never sign a matching operator key in a later slot.
+	if len(tx.Message.AccountKeys) == 0 || len(tx.Signatures) == 0 ||
+		!tx.Message.AccountKeys[0].Equals(operator) || !tx.Signatures[0].IsZero() {
 		return rawTx, nil
 	}
 	msgBytes, err := tx.Message.MarshalBinary()
@@ -395,7 +399,8 @@ func (a *Adapter) cosign(ctx context.Context, tx *solana.Transaction, rawTx []by
 	if len(signature) != 64 {
 		return nil, fmt.Errorf("operator signature length %d, want 64", len(signature))
 	}
-	offset := 1 + cosignIdx*64
+	const feePayerSignatureOffset = 1
+	offset := feePayerSignatureOffset
 	if offset+64 > len(rawTx) {
 		return nil, errors.New("signature slot offset out of range")
 	}

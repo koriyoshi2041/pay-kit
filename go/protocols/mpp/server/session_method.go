@@ -18,12 +18,13 @@ package server
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
 	"strconv"
 	"time"
 
-	solana "github.com/gagliardetto/solana-go"
-	"github.com/gagliardetto/solana-go/rpc"
+	solana "github.com/solana-foundation/solana-go/v2"
+	"github.com/solana-foundation/solana-go/v2/rpc"
 
 	"github.com/solana-foundation/pay-kit/go/paycore/solanatx"
 	core "github.com/solana-foundation/pay-kit/go/protocols/mpp/core"
@@ -107,13 +108,21 @@ type SessionOptions struct {
 	// server broadcasts a client-built open (OpenTxSubmitterServer).
 	PaymentChannelPayerSigner solanatx.Signer
 
-	// Store is the pluggable channel store. Defaults to in-memory.
+	// Store is the pluggable channel store. Outside localnet it must not be
+	// absent or a process-local *MemoryChannelStore unless
+	// PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1 explicitly opts into development
+	// replay protection. Localnet defaults to MemoryChannelStore.
 	Store ChannelStore
 
 	// RPC is the optional RPC client used for on-chain checks, the
 	// recentBlockhash prefetch, and settlement broadcasts. Nil skips every
 	// on-chain check and trusts payload claims as provided.
 	RPC solanatx.RPCClient
+
+	// Logger receives library-side diagnostics that have no synchronous
+	// caller to surface them, such as an idle-close settlement failure. Nil
+	// defaults to slog.Default().
+	Logger *slog.Logger
 }
 
 // Session is the server-side session method handler. Create with NewSession.
@@ -161,6 +170,10 @@ type Session struct {
 	// prefetch, and settlement broadcasts; nil skips every on-chain check
 	// and trusts payload claims as provided.
 	rpc solanatx.RPCClient
+
+	// logger receives library-side diagnostics with no synchronous caller
+	// (for example an idle-close settlement failure). Never nil.
+	logger *slog.Logger
 }
 
 // NewSession creates the server-side session method.
@@ -216,8 +229,24 @@ func NewSession(options SessionOptions) (*Session, error) {
 			"pullVoucherStrategy is required when modes includes pull")
 	}
 	store := options.Store
+	usesMemoryChannelStore := false
+	if store != nil {
+		_, usesMemoryChannelStore = store.(*MemoryChannelStore)
+	}
+	if options.Network != "localnet" && (store == nil || usesMemoryChannelStore) && os.Getenv(allowInMemoryReplayStoreEnvVar) != "1" {
+		storeDescription := "no session store"
+		if usesMemoryChannelStore {
+			storeDescription = "process-local *MemoryChannelStore"
+		}
+		return nil, core.NewError(core.ErrCodeInvalidConfig,
+			fmt.Sprintf("%s configured for %s; configure a shared session ChannelStore or set %s=1 to allow a process-local development store",
+				storeDescription, options.Network, allowInMemoryReplayStoreEnvVar))
+	}
 	if store == nil {
 		store = NewMemoryChannelStore()
+	}
+	if options.Logger == nil {
+		options.Logger = slog.Default()
 	}
 
 	config := SessionConfig{
@@ -233,6 +262,7 @@ func NewSession(options SessionOptions) (*Session, error) {
 		Modes:               options.Modes,
 		PullVoucherStrategy: options.PullVoucherStrategy,
 	}
+	config.VerifyTopUpTx = NewTopUpTxVerifier(config, options.RPC)
 	session := &Session{
 		core:            NewSessionServer(config, store),
 		secretKey:       options.SecretKey,
@@ -245,6 +275,7 @@ func NewSession(options SessionOptions) (*Session, error) {
 		signer:          options.Signer,
 		payerSigner:     options.PaymentChannelPayerSigner,
 		rpc:             options.RPC,
+		logger:          options.Logger,
 	}
 	if options.CloseDelay > 0 {
 		session.lifecycle = NewSessionLifecycle(session.closeOnIdle, options.CloseDelay)
@@ -279,7 +310,7 @@ func (s *Session) closeOnIdle(channelID string) {
 		return
 	}
 	if _, err := s.closeAndSettleChannel(context.Background(), channelID); err != nil {
-		log.Printf("[solana-mpp] idle-close settle failed for %s: %v", channelID, err)
+		s.logger.Error("idle-close settle failed", "channel", channelID, "err", err)
 	}
 }
 
@@ -469,6 +500,12 @@ func (s *Session) verifyPinnedSessionFields(credential core.PaymentCredential, r
 // payload (verifying or broadcasting the attached transaction when present),
 // enforce the deposit invariants, and insert the channel state atomically and
 // idempotently.
+//
+// This intentionally does not delegate to SessionServer.ProcessOpen: it is a
+// superset that adds transaction verification/broadcast and the idle-close
+// touch on top of the same insert invariant. The duplication is deliberate;
+// keep the shared invariant (finalized/authorized-signer/deposit checks) in
+// step with ProcessOpen.
 func (s *Session) handleOpen(ctx context.Context, payload *intents.OpenPayload) (string, error) {
 	mode := payload.Mode
 	if !s.core.supportsMode(mode) {
@@ -508,6 +545,7 @@ func (s *Session) handleOpen(ctx context.Context, payload *intents.OpenPayload) 
 			Operator:         s.core.config.Operator,
 			ProgramID:        s.core.config.ProgramID,
 			Recipient:        s.recipient,
+			Splits:           s.core.config.Splits,
 		}
 		if s.openTxSubmitter == OpenTxSubmitterServer {
 			if s.rpc == nil {
@@ -653,9 +691,9 @@ func (s *Session) handleCommit(ctx context.Context, payload *intents.CommitPaylo
 	return fmt.Sprintf("%s:%s:%s", receipt.SessionID, receipt.DeliveryID, receipt.Cumulative), nil
 }
 
-// handleTopUp raises a channel's deposit after optional on-chain
-// confirmation of the top-up signature. The receipt reference is the top-up
-// transaction signature.
+// handleTopUp raises a channel's deposit after the core binds the confirmed
+// top-up transaction to the channel and claimed deposit delta. The receipt
+// reference is the top-up transaction signature.
 func (s *Session) handleTopUp(ctx context.Context, payload *intents.TopUpPayload) (string, error) {
 	newDeposit, err := parseSessionU64(payload.NewDeposit, "newDeposit")
 	if err != nil {
@@ -665,25 +703,6 @@ func (s *Session) handleTopUp(ctx context.Context, payload *intents.TopUpPayload
 		return "", fmt.Errorf("newDeposit %d exceeds cap %d", newDeposit, s.cap)
 	}
 
-	// Cheap store pre-checks before touching the network.
-	existing, err := s.core.store.GetChannel(ctx, payload.ChannelID)
-	if err != nil {
-		return "", err
-	}
-	if existing == nil {
-		return "", fmt.Errorf("channel %s not found", payload.ChannelID)
-	}
-	if existing.Sealed {
-		return "", fmt.Errorf("channel %s is already sealed", payload.ChannelID)
-	}
-	if existing.CloseRequestedAt != nil {
-		return "", fmt.Errorf("channel %s close is pending; no further top-ups accepted", payload.ChannelID)
-	}
-	if s.rpc != nil {
-		if err := confirmTransactionSignature(ctx, s.rpc, payload.Signature, "topUp"); err != nil {
-			return "", err
-		}
-	}
 	if _, err := s.core.ProcessTopUp(ctx, payload); err != nil {
 		return "", err
 	}
