@@ -74,7 +74,21 @@ def _resolve_replay_store(config: Config, replay_store: Store | None) -> Store:
     is_localnet = config.network is Network.SOLANA_LOCALNET
     explicitly_unsafe = os.getenv(_ALLOW_INMEMORY_REPLAY_STORE_ENV) == "1"
     if replay_store is not None:
-        return replay_store
+        if is_localnet or getattr(replay_store, "is_shared", False):
+            return replay_store
+        if explicitly_unsafe:
+            logger.warning(
+                "solana_pay_kit: x402 is using an injected process-local replay store outside localnet because %s=1; "
+                "replay protection will not survive restarts or span replicas",
+                _ALLOW_INMEMORY_REPLAY_STORE_ENV,
+            )
+            return replay_store
+        raise ConfigurationError(
+            "solana_pay_kit: x402 requires an injected shared replay_store outside localnet; "
+            f"the provided {type(replay_store).__name__} reports is_shared=False. "
+            f"Inject a shared Store, or set {_ALLOW_INMEMORY_REPLAY_STORE_ENV}=1 "
+            "to explicitly acknowledge single-process development scope."
+        )
     if replay_store is None and is_localnet:
         return MemoryStore()
     if explicitly_unsafe:
