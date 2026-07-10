@@ -8,20 +8,14 @@ name: Semgrep (radar L7)
 #   - self-test: every *.bad.* fixture MUST fire, every *.good.* MUST stay clean
 #   - scan:      run the ruleset over the real source tree (typescript/, go/, python/)
 #
-# Pull requests retain an advisory report while the multi-language remediation
-# stack is landing. The reusable release-gate invocation sets `enforce: true`:
-# a release can never pass with an untriaged source finding.
+# Every source scan is blocking. A security-rule finding is either a real
+# regression or a rule-quality defect that must be resolved before merge.
 
 on:
   push:
     branches: [main]
   pull_request:
   workflow_call:
-    inputs:
-      enforce:
-        type: boolean
-        required: false
-        default: false
 
 permissions:
   contents: read
@@ -36,17 +30,5 @@ jobs:
       - name: Self-test rules against fixtures (blocking)
         run: docker run --rm -v "$PWD:/src" -w /src semgrep/semgrep@sha256:59fbed6127ea7c5dde3ba6a85142733bb20ea9aaa36120c953904f1539aaf66e bash harness/semgrep/run.sh --test
 
-      - name: Scan real source
-        env:
-          SEMGREP_ENFORCE: ${{ inputs.enforce && '1' || '0' }}
-        run: |
-          set +e
-          docker run --rm -e SEMGREP_ERROR_ON_FINDINGS=1 -v "$PWD:/src" -w /src semgrep/semgrep@sha256:59fbed6127ea7c5dde3ba6a85142733bb20ea9aaa36120c953904f1539aaf66e bash harness/semgrep/run.sh typescript go python
-          status=$?
-          set -e
-          if [ "$status" -ne 0 ]; then
-            if [ "$SEMGREP_ENFORCE" = "1" ]; then
-              exit "$status"
-            fi
-            echo "::warning::Semgrep found blocking source matches; release-gate enforcement remains red until they are remediated."
-          fi
+      - name: Scan real source (blocking)
+        run: docker run --rm -e SEMGREP_ERROR_ON_FINDINGS=1 -v "$PWD:/src" -w /src semgrep/semgrep@sha256:59fbed6127ea7c5dde3ba6a85142733bb20ea9aaa36120c953904f1539aaf66e bash harness/semgrep/run.sh typescript go python

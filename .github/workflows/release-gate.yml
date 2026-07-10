@@ -65,8 +65,6 @@ jobs:
   semgrep:
     name: Semgrep
     uses: ./.github/workflows/semgrep.yml
-    with:
-      enforce: true
 
   gate:
     name: All release gates green
