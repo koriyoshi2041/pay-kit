@@ -40,28 +40,12 @@ const CI_EXEMPT: Record<string, CiExemption> = {
     removalCondition:
       "Remove when the workflow provisions a deterministic local validator for this file.",
   },
-  "x402-exact.e2e.test.ts": {
-    owner: "x402",
-    reason:
-      "Needs the opt-in X402_HARNESS_* surfnet and real SDK server setup.",
-    lastReviewed: "2026-07-10",
-    removalCondition:
-      "Remove when the standard matrix runs this file against provisioned SDK servers.",
-  },
   "x402-upto.e2e.test.ts": {
     owner: "x402",
     reason: "Needs a live surfnet and the deployed payment-channels program.",
     lastReviewed: "2026-07-10",
     removalCondition:
       "Remove when the standard matrix provisions the program and executes this file.",
-  },
-  "cross-server-scenarios.test.ts": {
-    owner: "harness",
-    reason:
-      "Needs multiple live SDK servers and the opt-in X402_HARNESS_CROSS_SERVER setup.",
-    lastReviewed: "2026-07-10",
-    removalCondition:
-      "Remove when the standard matrix provisions every required server pair.",
   },
   // protocol-conformance.test.ts is no longer exempt: it now honors
   // MPP_CONFORMANCE_LANGUAGES (spawn loop filtered) and is wired into ci.yml
@@ -142,6 +126,7 @@ const DIRECT_NON_PUBLISH_WORKFLOWS = [
   "php.yml",
   "python.yml",
   "ruby.yml",
+  "semgrep.yml",
   "swift.yml",
 ] as const;
 
@@ -243,5 +228,12 @@ describe("workflow hygiene gate: direct non-publish workflows are read-only by d
         name.includes("publish"),
       ),
     ).toBe(false);
+  });
+
+  it("pins the Semgrep runtime and reserves blocking enforcement for release gates", () => {
+    const source = readFileSync(join(workflowsDir, "semgrep.yml"), "utf8");
+    expect(source).toMatch(/semgrep\/semgrep@sha256:[a-f0-9]{64}/);
+    expect(source).not.toMatch(/pip install semgrep/);
+    expect(source).toMatch(/SEMGREP_ERROR_ON_FINDINGS=1/);
   });
 });
