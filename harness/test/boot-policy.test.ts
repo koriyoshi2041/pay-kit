@@ -366,7 +366,7 @@ const sourceContractProbes: SourceContractProbe[] = [
         file: "rust/crates/kit/src/mpp/server/charge.rs",
         mechanism: "permits memory fallback only through the explicit unsafe opt-in",
         pattern:
-          /None if config\.allow_unsafe_memory_store\s*=>[\s\S]*?Arc::new\(MemoryStore::new\(\)\),[\s\S]*?None\s*=>[\s\S]*?atomic durable shared replay store is required/,
+          /None if config\.allow_unsafe_memory_store\s*=>[\s\S]*?Arc::new\(MemoryStore::new\(\)\)[\s\S]*?None\s*=>[\s\S]*?atomic durable shared replay store is required/,
       },
       {
         file: "rust/crates/kit/src/mpp/server/session.rs",
