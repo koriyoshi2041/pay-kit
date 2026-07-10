@@ -20,6 +20,10 @@ from solana_pay_kit.errors import PaymentRequiredError, ProtocolNotSupportedErro
 SECRET = "challenge-binding-secret-long-enough-for-hmac"
 
 
+class _SharedMemoryStore(MemoryStore):
+    is_shared = True
+
+
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch):
     reset()
@@ -111,7 +115,7 @@ def test_fastapi_x402_only_production_threads_replay_store(monkeypatch):
     import solana_pay_kit.fastapi as pk_fastapi
 
     cfg = Config(network=Network.SOLANA_DEVNET, accept=(Protocol.X402,), preflight=False)
-    store = MemoryStore()
+    store = _SharedMemoryStore()
 
     async def assert_store(self, gate_ref, pricing, request):
         assert self._x402 is not None
@@ -243,7 +247,7 @@ def test_flask_x402_only_production_threads_replay_factory(monkeypatch):
     import solana_pay_kit.flask as pk_flask
 
     cfg = Config(network=Network.SOLANA_MAINNET, accept=(Protocol.X402,), preflight=False)
-    store = MemoryStore()
+    store = _SharedMemoryStore()
     calls = 0
 
     def factory(config):
@@ -374,7 +378,7 @@ def test_django_x402_only_production_threads_replay_store(monkeypatch):
     import solana_pay_kit.django as pk_django
 
     cfg = Config(network=Network.SOLANA_DEVNET, accept=(Protocol.X402,), preflight=False)
-    store = MemoryStore()
+    store = _SharedMemoryStore()
 
     async def assert_store(self, gate_ref, pricing, request):
         assert self._x402 is not None

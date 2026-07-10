@@ -245,6 +245,7 @@ class _FakeRpc:
 def _clean(monkeypatch):
     reset()
     monkeypatch.setenv("PAY_KIT_DISABLE_PREFLIGHT", "1")
+    monkeypatch.setenv("PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE", "1")
     yield
     reset()
 
