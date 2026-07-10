@@ -235,12 +235,16 @@ async def test_confirmation_timeout_raises_and_does_not_return_success(monkeypat
         await adapter.verify_and_settle(gate, _Req(header))
     assert exc.value.code == "payment_invalid"
     assert "confirmation failed" in str(exc.value)
-    # Reservation must be rolled back so an honest retry can replay.
-    assert await store.get("x402-svm-exact:consumed:SIG-timeout") is None
+    # Timeout is inconclusive: the transaction may still land, so the atomic
+    # reservation must remain and a retry cannot serve the same payment again.
+    assert await store.get("x402-svm-exact:consumed:SIG-timeout") is True
+    with pytest.raises(InvalidProofError) as replay_exc:
+        await adapter.verify_and_settle(gate, _Req(header))
+    assert replay_exc.value.code == "signature_consumed"
 
 
 @pytest.mark.asyncio
-async def test_confirmation_onchain_failure_rolls_back_reservation(monkeypatch):
+async def test_confirmation_onchain_failure_keeps_reservation(monkeypatch):
     from solana_pay_kit._paycore.errors import PaymentError
 
     store = MemoryStore()
@@ -253,7 +257,7 @@ async def test_confirmation_onchain_failure_rolls_back_reservation(monkeypatch):
     header = _build_envelope(adapter, gate, op_kp)
     with pytest.raises(InvalidProofError):
         await adapter.verify_and_settle(gate, _Req(header))
-    assert await store.get("x402-svm-exact:consumed:SIG-revert") is None
+    assert await store.get("x402-svm-exact:consumed:SIG-revert") is True
 
 
 # -- sub-microunit price truncation (149-2) ----------------------------------

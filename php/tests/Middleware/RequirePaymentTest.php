@@ -33,6 +33,11 @@ final class RequirePaymentTest extends TestCase
 
     protected function setUp(): void
     {
+        // These tests exercise middleware routing, not replay protection. The
+        // devnet config would otherwise trip the off-localnet shared-store guard
+        // when RequirePayment auto-constructs its adapters, so opt into
+        // single-process scope for the suite.
+        putenv('PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1');
         $this->client = new PayKit(new Config(
             network: Network::SolanaDevnet,
             operator: new Operator(recipient: Signer::generate()->pubkey(), signer: Signer::generate(), feePayer: true),
@@ -43,6 +48,11 @@ final class RequirePaymentTest extends TestCase
             ),
         ));
         $this->factory = new Psr17Factory();
+    }
+
+    protected function tearDown(): void
+    {
+        putenv('PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE');
     }
 
     private function nextHandler(): RequestHandlerInterface

@@ -607,3 +607,9 @@ def reset() -> None:
     global _config
     _config = None
     _warned_deprecations.clear()
+    # Framework cores contain protocol adapters and replay stores. Clear their
+    # weak caches alongside the singleton so tests/reconfiguration cannot retain
+    # stale adapter state.
+    from solana_pay_kit._middleware import reset_core_cache
+
+    reset_core_cache()

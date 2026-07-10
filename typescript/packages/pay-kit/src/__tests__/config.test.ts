@@ -1,3 +1,4 @@
+import { Store } from 'mppx';
 import { describe, expect, it } from 'vitest';
 
 import { configure, configureFromEnv } from '../config.js';

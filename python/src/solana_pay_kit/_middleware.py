@@ -35,7 +35,9 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 from solana_pay_kit._paycore.protocol import Protocol
+from solana_pay_kit._paycore.store import MemoryStore, Store
 from solana_pay_kit.errors import (
+    ConfigurationError,
     InvalidProofError,
     PaymentRequiredError,
     ProtocolNotSupportedError,
@@ -59,6 +61,7 @@ __all__ = [
     "is_paid_for",
     "payment",
     "PAYMENT_ATTR",
+    "X402ReplayStoreFactory",
 ]
 
 #: Request attribute the framework shims write the verified payment under.
@@ -74,7 +77,52 @@ GateRef = "Gate | DynamicGate | Price | str | Callable[[Any], Gate]"
 #: the lifetime of that config. Weak keys let a dropped config (e.g. a test
 #: ``reset()``) and its cached core be collected. The Config is frozen, so a
 #: cached core never observes stale settings.
-_CORE_CACHE: weakref.WeakKeyDictionary[Config, PayCore] = weakref.WeakKeyDictionary()
+_CORE_CACHE: weakref.WeakKeyDictionary[Config, weakref.ReferenceType[PayCore]] = weakref.WeakKeyDictionary()
+_MPP_STORE_CACHE: weakref.WeakKeyDictionary[Config, Store] = weakref.WeakKeyDictionary()
+_X402_STORE_CACHE: weakref.WeakKeyDictionary[Config, Store] = weakref.WeakKeyDictionary()
+
+X402ReplayStoreFactory = Callable[["Config"], object]
+
+
+def _replay_stores(
+    config: Config,
+    x402_replay_store: Store | None,
+    x402_replay_store_factory: X402ReplayStoreFactory | None,
+) -> tuple[Store, Store | None]:
+    if x402_replay_store is not None and x402_replay_store_factory is not None:
+        raise ConfigurationError("pass x402_replay_store or x402_replay_store_factory, not both")
+
+    mpp_store = _MPP_STORE_CACHE.get(config)
+    if mpp_store is None:
+        mpp_store = MemoryStore()
+        _MPP_STORE_CACHE[config] = mpp_store
+
+    if Protocol.X402 not in config.accept:
+        return mpp_store, None
+
+    if x402_replay_store is not None:
+        _X402_STORE_CACHE[config] = x402_replay_store
+        return mpp_store, x402_replay_store
+
+    cached = _X402_STORE_CACHE.get(config)
+    if cached is not None:
+        return mpp_store, cached
+
+    if x402_replay_store_factory is not None:
+        built = x402_replay_store_factory(config)
+        if not isinstance(built, Store):
+            raise ConfigurationError("x402_replay_store_factory must return an atomic Store")
+        _X402_STORE_CACHE[config] = built
+        return mpp_store, built
+
+    return mpp_store, None
+
+
+def reset_core_cache() -> None:
+    """Clear framework adapter/store caches when config.reset() is called."""
+    _CORE_CACHE.clear()
+    _MPP_STORE_CACHE.clear()
+    _X402_STORE_CACHE.clear()
 
 
 class PayCore:
@@ -92,21 +140,33 @@ class PayCore:
         *,
         mpp: MppAdapter | None = None,
         x402: X402Adapter | None = None,
+        x402_replay_store: Store | None = None,
+        x402_replay_store_factory: X402ReplayStoreFactory | None = None,
     ) -> None:
         """Bind to ``config`` and resolve (or inject) the scheme adapters."""
+        mpp_store, resolved_x402_store = _replay_stores(
+            config, x402_replay_store, x402_replay_store_factory
+        )
         self._config = config
-        self._mpp = mpp if mpp is not None else MppAdapter(config)
+        self._mpp = mpp if mpp is not None else MppAdapter(config, replay_store=mpp_store)
+        self._x402_replay_store = resolved_x402_store
         # Auto-wire the x402 adapter only when the config accept list includes
         # it; mirrors the PHP constructor. An explicit adapter always wins.
         if x402 is not None:
             self._x402: X402Adapter | None = x402
         elif Protocol.X402 in config.accept:
-            self._x402 = X402Adapter(config)
+            self._x402 = X402Adapter(config, replay_store=resolved_x402_store)
         else:
             self._x402 = None
 
     @classmethod
-    def for_config(cls, config: Config) -> PayCore:
+    def for_config(
+        cls,
+        config: Config,
+        *,
+        x402_replay_store: Store | None = None,
+        x402_replay_store_factory: X402ReplayStoreFactory | None = None,
+    ) -> PayCore:
         """Return the cached per-Config core, building (and caching) one on miss.
 
         The framework shims call this once per request; reusing one core per
@@ -115,11 +175,15 @@ class PayCore:
         cannot be replayed. A fresh ``PayCore(config)`` per request (the prior
         behaviour) reset that store on every call.
         """
-        cached = _CORE_CACHE.get(config)
-        if cached is not None:
+        _, resolved_x402_store = _replay_stores(
+            config, x402_replay_store, x402_replay_store_factory
+        )
+        cached_ref = _CORE_CACHE.get(config)
+        cached = cached_ref() if cached_ref is not None else None
+        if cached is not None and cached._x402_replay_store is resolved_x402_store:
             return cached
-        core = cls(config)
-        _CORE_CACHE[config] = core
+        core = cls(config, x402_replay_store=resolved_x402_store)
+        _CORE_CACHE[config] = weakref.ref(core)
         return core
 
     @property

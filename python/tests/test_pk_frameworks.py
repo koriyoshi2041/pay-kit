@@ -12,7 +12,8 @@ from __future__ import annotations
 import pytest
 
 import solana_pay_kit._middleware as mw
-from solana_pay_kit import MppConfig, Payment, Price, Protocol, Stablecoin, configure
+from solana_pay_kit import Config, MppConfig, Network, Payment, Price, Protocol, Stablecoin, configure
+from solana_pay_kit._paycore.store import MemoryStore
 from solana_pay_kit.config import reset
 from solana_pay_kit.errors import PaymentRequiredError, ProtocolNotSupportedError
 
@@ -101,6 +102,37 @@ def test_fastapi_success_attaches_payment_and_settlement(monkeypatch):
     assert resp.status_code == 200
     assert resp.json() == {"ok": True, "tx": "sig-abc"}
     assert resp.headers.get("x-payment-settlement-signature") == "sig-abc"
+
+
+def test_fastapi_x402_only_production_threads_replay_store(monkeypatch):
+    from fastapi import Depends, FastAPI
+    from starlette.testclient import TestClient
+
+    import solana_pay_kit.fastapi as pk_fastapi
+
+    cfg = Config(network=Network.SOLANA_DEVNET, accept=(Protocol.X402,), preflight=False)
+    store = MemoryStore()
+
+    async def assert_store(self, gate_ref, pricing, request):
+        assert self._x402 is not None
+        assert self._x402._store is store
+        raise _stub_402()
+
+    monkeypatch.setattr(mw.PayCore, "process", assert_store)
+    app = FastAPI()
+    dep = Depends(
+        pk_fastapi.RequirePayment(
+            Price.usd("0.10", Stablecoin.USDC),
+            config=cfg,
+            x402_replay_store=store,
+        )
+    )
+
+    @app.get("/report")
+    async def report(payment=dep):
+        return {"ok": True}
+
+    assert TestClient(app).get("/report").status_code == 402
 
 
 def test_fastapi_exception_handler_renders_pay_kit_error(monkeypatch):
@@ -205,6 +237,42 @@ def test_flask_success_attaches_g_and_settlement(monkeypatch):
     assert resp.headers.get("x-payment-settlement-signature") == "sig-abc"
 
 
+def test_flask_x402_only_production_threads_replay_factory(monkeypatch):
+    import flask
+
+    import solana_pay_kit.flask as pk_flask
+
+    cfg = Config(network=Network.SOLANA_MAINNET, accept=(Protocol.X402,), preflight=False)
+    store = MemoryStore()
+    calls = 0
+
+    def factory(config):
+        nonlocal calls
+        calls += 1
+        assert config is cfg
+        return store
+
+    async def assert_store(self, gate_ref, pricing, request):
+        assert self._x402 is not None
+        assert self._x402._store is store
+        raise _stub_402()
+
+    monkeypatch.setattr(mw.PayCore, "process", assert_store)
+    app = flask.Flask(__name__)
+
+    @app.get("/report")
+    @pk_flask.require_payment(
+        Price.usd("0.10", Stablecoin.USDC),
+        config=cfg,
+        x402_replay_store_factory=factory,
+    )
+    def report():
+        return {"ok": True}
+
+    assert app.test_client().get("/report").status_code == 402
+    assert calls == 1
+
+
 def test_flask_non_402_pay_kit_error(monkeypatch):
     import flask
 
@@ -297,6 +365,33 @@ def test_django_decorator_success_attaches_and_settles(monkeypatch):
     resp = view(RequestFactory().get("/report"))
     assert resp.status_code == 200
     assert resp["x-payment-settlement-signature"] == "sig-abc"
+
+
+def test_django_x402_only_production_threads_replay_store(monkeypatch):
+    from django.http import JsonResponse
+    from django.test import RequestFactory
+
+    import solana_pay_kit.django as pk_django
+
+    cfg = Config(network=Network.SOLANA_DEVNET, accept=(Protocol.X402,), preflight=False)
+    store = MemoryStore()
+
+    async def assert_store(self, gate_ref, pricing, request):
+        assert self._x402 is not None
+        assert self._x402._store is store
+        raise _stub_402()
+
+    monkeypatch.setattr(mw.PayCore, "process", assert_store)
+
+    @pk_django.require_payment(
+        Price.usd("0.10", Stablecoin.USDC),
+        config=cfg,
+        x402_replay_store=store,
+    )
+    def view(request):
+        return JsonResponse({"ok": True})
+
+    assert view(RequestFactory().get("/report")).status_code == 402
 
 
 def test_django_decorator_non_402_error(monkeypatch):

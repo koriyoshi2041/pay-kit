@@ -9,11 +9,17 @@ attribute / mapping / ``.state`` request shapes.
 
 from __future__ import annotations
 
+import gc
+import weakref
+
 import pytest
 
+import solana_pay_kit._middleware as middleware_module
 from solana_pay_kit import (
+    Config,
     Gate,
     MppConfig,
+    Network,
     Payment,
     Price,
     Pricing,
@@ -100,6 +106,39 @@ def test_for_config_distinct_cores_for_distinct_configs():
     cfg_b = _cfg(accept=(Protocol.X402, Protocol.MPP))
     assert cfg_a != cfg_b
     assert PayCore.for_config(cfg_a) is not PayCore.for_config(cfg_b)
+
+
+def test_core_cache_does_not_retain_config_cycle():
+    cfg = Config(
+        network=Network.SOLANA_LOCALNET,
+        accept=(Protocol.MPP,),
+        preflight=False,
+        mpp=MppConfig(challenge_binding_secret=SECRET),
+    )
+    core = PayCore.for_config(cfg)
+    cfg_ref = weakref.ref(cfg)
+    core_ref = weakref.ref(core)
+    assert len(middleware_module._CORE_CACHE) == 1
+
+    del core
+    del cfg
+    gc.collect()
+
+    assert core_ref() is None
+    assert cfg_ref() is None
+    assert len(middleware_module._CORE_CACHE) == 0
+    assert len(middleware_module._MPP_STORE_CACHE) == 0
+
+
+def test_reset_clears_core_and_store_caches():
+    cfg = _cfg(accept=(Protocol.MPP,))
+    PayCore.for_config(cfg)
+    assert middleware_module._CORE_CACHE
+    assert middleware_module._MPP_STORE_CACHE
+    reset()
+    assert not middleware_module._CORE_CACHE
+    assert not middleware_module._MPP_STORE_CACHE
+    assert not middleware_module._X402_STORE_CACHE
 
 
 @pytest.mark.asyncio

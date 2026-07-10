@@ -20,7 +20,12 @@ import type { PayKitConfig } from '../config.js';
 import { InvalidProofError } from '../errors.js';
 import type { Price } from '../price.js';
 import { caip2 } from '../protocol.js';
-import { errorMessage, x402PaymentHeader } from './x402-shared.js';
+import {
+    assertPaymentHeaderWithinCap,
+    ChallengeBlockhashCache,
+    errorMessage,
+    x402PaymentHeader,
+} from './x402-shared.js';
 
 /** Settlement-response header mirrored by the x402 SDK family. */
 const PAYMENT_RESPONSE_HEADER = 'x-payment-response';
@@ -105,6 +110,7 @@ export class X402Upto {
     readonly #recipient: string;
     readonly #rpcUrl: string;
     readonly #stablecoins: readonly string[];
+    readonly #blockhashCache = new ChallengeBlockhashCache();
 
     constructor(config: PayKitConfig) {
         this.#network = caip2(config.network) as Network;
@@ -163,6 +169,7 @@ export class X402Upto {
     async verifyOpen(request: Request, maxPrice: Price): Promise<UptoVerified> {
         const header = x402PaymentHeader(request);
         if (!header) throw new InvalidProofError('missing_x402_payment_header');
+        assertPaymentHeaderWithinCap(header);
 
         let payload: PaymentPayload;
         try {
@@ -296,21 +303,17 @@ export class X402Upto {
      */
     async #challengeRequirements(maxPrice: Price): Promise<PaymentRequirements> {
         const base = this.#requirements(maxPrice);
-        let context, value;
-        try {
-            ({ context, value } = await createSolanaRpc(this.#rpcUrl).getLatestBlockhash().send());
-        } catch (error) {
-            throw new Error(
-                `x402 upto challenge requires extra.recentBlockhash/recentSlot; getLatestBlockhash failed: ${errorMessage(error)}`,
-            );
+        const cached = await this.#blockhashCache.recentBlockhash(this.#rpcUrl);
+        if (cached === undefined) {
+            throw new Error('x402 upto challenge requires extra.recentBlockhash/recentSlot; getLatestBlockhash failed');
         }
         return {
             ...base,
             extra: {
                 ...base.extra,
-                lastValidBlockHeight: value.lastValidBlockHeight.toString(),
-                recentBlockhash: value.blockhash,
-                recentSlot: context.slot.toString(),
+                lastValidBlockHeight: cached.lastValidBlockHeight,
+                recentBlockhash: cached.blockhash,
+                recentSlot: cached.recentSlot,
             },
         };
     }

@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
 from solana_pay_kit._paycore.currency import parse_units
 from solana_pay_kit._paycore.mints import resolve, token_program_for
+from solana_pay_kit._paycore.network import Network
 from solana_pay_kit._paycore.network_check import check_network_blockhash
 from solana_pay_kit._paycore.protocol import Protocol
 from solana_pay_kit._paycore.rpc import SolanaRpc
@@ -64,6 +66,31 @@ _RESPONSE_HEADER_LEGACY = "x-payment-response"
 _REPLAY_PREFIX = "x402-svm-exact:consumed:"
 _ALLOW_INMEMORY_REPLAY_STORE_ENV = "PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE"
 
+logger = logging.getLogger("solana_pay_kit")
+
+
+def _resolve_replay_store(config: Config, replay_store: Store | None) -> Store:
+    """Resolve x402 replay storage without silently weakening production."""
+    is_localnet = config.network is Network.SOLANA_LOCALNET
+    explicitly_unsafe = os.getenv(_ALLOW_INMEMORY_REPLAY_STORE_ENV) == "1"
+    if replay_store is not None:
+        return replay_store
+    if replay_store is None and is_localnet:
+        return MemoryStore()
+    if explicitly_unsafe:
+        logger.warning(
+            "solana_pay_kit: x402 is using a process-local replay store outside localnet because %s=1; "
+            "replay protection will not survive restarts or span replicas",
+            _ALLOW_INMEMORY_REPLAY_STORE_ENV,
+        )
+        return MemoryStore()
+    raise ConfigurationError(
+        "solana_pay_kit: x402 requires an injected shared replay_store outside localnet; "
+        "the default MemoryStore is process-local and would accept replays after a restart or on another replica. "
+        f"Inject a Store with atomic put_if_absent support, or set {_ALLOW_INMEMORY_REPLAY_STORE_ENV}=1 "
+        "to explicitly acknowledge single-process development scope."
+    )
+
 
 class X402Adapter:
     """Self-hosted server adapter for the x402 ``exact`` Solana scheme."""
@@ -81,15 +108,7 @@ class X402Adapter:
                 "leave X402Config.facilitator_url None for self-hosted"
             )
         self._config = config
-        uses_memory_store = replay_store is None or isinstance(replay_store, MemoryStore)
-        is_localnet = config.network.mints_label() == "localnet"
-        if uses_memory_store and not is_localnet and os.getenv(_ALLOW_INMEMORY_REPLAY_STORE_ENV) != "1":
-            raise ConfigurationError(
-                "solana_pay_kit: a durable replay_store is required outside localnet; set "
-                f"{_ALLOW_INMEMORY_REPLAY_STORE_ENV}=1 to explicitly allow a process-local "
-                "MemoryStore for development"
-            )
-        self._store = replay_store if replay_store is not None else MemoryStore()
+        self._store = _resolve_replay_store(config, replay_store)
         self._recent_blockhash_provider = recent_blockhash_provider
 
     def accepts_entry(self, gate: Gate, request: Any) -> X402AcceptsEntry:
@@ -255,14 +274,16 @@ class X402Adapter:
             # ``transaction-failed`` (included but reverted) or
             # ``transaction-not-found`` (never confirmed inside the window).
             #
-            # On failure roll the reservation back: the transaction did not
-            # land, so the same signature must remain replayable for an honest
-            # retry. Mirrors the confirmation gate the MPP charge flow runs
-            # (protocols/mpp/server/charge.py).
+            # Once broadcast succeeds, confirmation errors are not proof that
+            # the transaction failed to land. A timeout may confirm later, and
+            # an on-chain failure still consumed the transaction's signature.
+            # Keep the atomic reservation for every post-broadcast outcome;
+            # Python has no blockhash-expiry/status combination here that can
+            # prove the transaction will never land. Pre-broadcast failures do
+            # not need rollback because the reservation has not been created.
             try:
                 await rpc.await_confirmation(signature)
             except Exception as exc:  # noqa: BLE001
-                await self._store.delete(replay_key)
                 raise InvalidProofError(
                     f"solana_pay_kit: invalid proof: confirmation failed: {exc}", code="payment_invalid"
                 ) from exc

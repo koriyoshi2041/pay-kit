@@ -31,7 +31,8 @@ from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
 import flask
 from flask import abort, g, make_response
 
-from solana_pay_kit._middleware import PAYMENT_ATTR, PayCore
+from solana_pay_kit._middleware import PAYMENT_ATTR, PayCore, X402ReplayStoreFactory
+from solana_pay_kit._paycore.store import Store
 from solana_pay_kit.config import config as _global_config
 from solana_pay_kit.errors import InvalidProofError, PayKitError, PaymentRequiredError
 from solana_pay_kit.payment import Payment
@@ -82,6 +83,8 @@ def require_payment(
     *,
     pricing: Pricing | None = None,
     config: Config | None = None,
+    x402_replay_store: Store | None = None,
+    x402_replay_store_factory: X402ReplayStoreFactory | None = None,
 ) -> Callable[[_F], _F]:
     """Decorate a Flask view so it serves only after a verified payment.
 
@@ -96,7 +99,11 @@ def require_payment(
         @wraps(view)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             request = flask.request
-            core = PayCore.for_config(config if config is not None else _global_config())
+            core = PayCore.for_config(
+                config if config is not None else _global_config(),
+                x402_replay_store=x402_replay_store,
+                x402_replay_store_factory=x402_replay_store_factory,
+            )
             try:
                 payment_obj = _run(core.process(gate_ref, pricing, request))
             except PaymentRequiredError as exc:
