@@ -17,7 +17,7 @@ const deliveries = {
     230: ['fix/kotlin-canonical-json-hardening', 'd286dd9'],
     231: ['fix/swift-conformance-hardening', '63ca1c3'],
     232: ['fix/typescript-security-hardening', '74d4d99'],
-    233: ['fix/harness-adversarial-hardening', 'ee11ee4'],
+    233: ['fix/harness-adversarial-hardening', 'd9815dc'],
     236: ['fix/x402-replay-hardening', '10708ce'],
     237: ['fix/mpp-replay-store-hardening', '9bfd9e1'],
     238: ['fix/mpp-subscription-hardening', '1865dfb'],

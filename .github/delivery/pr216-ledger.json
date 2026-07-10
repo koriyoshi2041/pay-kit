@@ -28,7 +28,7 @@
     "harness-ci",
     "cross-sdk"
   ],
-  "deliveryBaseline": "96f8fee430c2c06101bae4df674256f72c2df946",
+  "deliveryBaseline": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f",
   "summary": {
     "commits": {
       "open_pr": 22,
@@ -3034,7 +3034,7 @@
           "sourceBlob": "4d2427fb49389c07d455d5d2ffa87d29deb3ac5c",
           "deliveryBlob": "4d2427fb49389c07d455d5d2ffa87d29deb3ac5c",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:.github/actions/setup-harness-leg/action.yml",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:.github/actions/setup-harness-leg/action.yml",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:.github/actions/setup-harness-leg/action.yml",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -3086,7 +3086,7 @@
           "sourceBlob": "3d8068e3ee1acb864ab1220779b57536ddfdd41d",
           "deliveryBlob": "3d8068e3ee1acb864ab1220779b57536ddfdd41d",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:.github/dependabot.yml",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:.github/dependabot.yml",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:.github/dependabot.yml",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -3320,7 +3320,7 @@
           "sourceBlob": "0d287637e0915c1fd380c158f286639c3f5b3e9f",
           "deliveryBlob": "0d287637e0915c1fd380c158f286639c3f5b3e9f",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:.github/workflows/npm-publish.yml",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:.github/workflows/npm-publish.yml",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:.github/workflows/npm-publish.yml",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -3372,7 +3372,7 @@
           "sourceBlob": "47471237a0a32dbfbbef3956a15899c2c19a2743",
           "deliveryBlob": "47471237a0a32dbfbbef3956a15899c2c19a2743",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:.github/workflows/pypi-publish.yml",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:.github/workflows/pypi-publish.yml",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:.github/workflows/pypi-publish.yml",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -3450,7 +3450,7 @@
           "sourceBlob": "9d847c4bc4e12cb345c98997555003bca239b27e",
           "deliveryBlob": "9d847c4bc4e12cb345c98997555003bca239b27e",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:.github/workflows/report.yml",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:.github/workflows/report.yml",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:.github/workflows/report.yml",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -3528,7 +3528,7 @@
           "sourceBlob": "dae3eb892e4e58ecc7add70c5a407bdec5d46870",
           "deliveryBlob": "dae3eb892e4e58ecc7add70c5a407bdec5d46870",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:.gitignore",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:.gitignore",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:.gitignore",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -3580,7 +3580,7 @@
           "sourceBlob": "cb96142e236fbe9326d829f1e93ef61975264d29",
           "deliveryBlob": "cb96142e236fbe9326d829f1e93ef61975264d29",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:SECURITY.md",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:SECURITY.md",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:SECURITY.md",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -4406,7 +4406,7 @@
           "sourceBlob": "959c9d54abb8c272d0abfef2da6dfcbe54336661",
           "deliveryBlob": "959c9d54abb8c272d0abfef2da6dfcbe54336661",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:harness/php-server/server.php",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:harness/php-server/server.php",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:harness/php-server/server.php",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -4458,7 +4458,7 @@
           "sourceBlob": "edfbb49d4fb7c709c76598dde1be1ab49d4dca46",
           "deliveryBlob": "edfbb49d4fb7c709c76598dde1be1ab49d4dca46",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:harness/pnpm-workspace.yaml",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:harness/pnpm-workspace.yaml",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:harness/pnpm-workspace.yaml",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -4567,7 +4567,7 @@
           "sourceBlob": "759c9e15e9862b31d9812e92de4541788dcd3794",
           "deliveryBlob": "759c9e15e9862b31d9812e92de4541788dcd3794",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:harness/ruby-server/test_server_io_caps.rb",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:harness/ruby-server/test_server_io_caps.rb",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:harness/ruby-server/test_server_io_caps.rb",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -4801,7 +4801,7 @@
           "sourceBlob": "799c80184dbd41dfe17117de65180ab13598549d",
           "deliveryBlob": "799c80184dbd41dfe17117de65180ab13598549d",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:harness/test/onchain-gate.ts",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:harness/test/onchain-gate.ts",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:harness/test/onchain-gate.ts",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -4827,7 +4827,7 @@
           "sourceBlob": "07ae4f40ec5752738e41abee9094a7f9c3df990b",
           "deliveryBlob": "07ae4f40ec5752738e41abee9094a7f9c3df990b",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:harness/test/onchain.setup.ts",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:harness/test/onchain.setup.ts",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:harness/test/onchain.setup.ts",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -4905,7 +4905,7 @@
           "sourceBlob": "bcfd9e0fa17a323e5cde46fa766235096b92eacc",
           "deliveryBlob": "bcfd9e0fa17a323e5cde46fa766235096b92eacc",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:harness/vectors/x402-exact-reject.json",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:harness/vectors/x402-exact-reject.json",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:harness/vectors/x402-exact-reject.json",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -4931,7 +4931,7 @@
           "sourceBlob": "aea8119e2385ffeb5fd256469fd7e00532e8f83c",
           "deliveryBlob": "aea8119e2385ffeb5fd256469fd7e00532e8f83c",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:harness/vitest.config.ts",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:harness/vitest.config.ts",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:harness/vitest.config.ts",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -4957,7 +4957,7 @@
           "sourceBlob": "57483135a54581dadb458fc42cd4f0834b6f3df5",
           "deliveryBlob": "57483135a54581dadb458fc42cd4f0834b6f3df5",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:harness/vitest.onchain.config.ts",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:harness/vitest.onchain.config.ts",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:harness/vitest.onchain.config.ts",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -5041,7 +5041,7 @@
           "sourceBlob": "3b4aaa6838a1789ebc2c8c9a59b7ecf7b3a7984d",
           "deliveryBlob": "3b4aaa6838a1789ebc2c8c9a59b7ecf7b3a7984d",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:lua/pay_kit/protocols/mpp/server/solana_verify.lua",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:lua/pay_kit/protocols/mpp/server/solana_verify.lua",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:lua/pay_kit/protocols/mpp/server/solana_verify.lua",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -5093,7 +5093,7 @@
           "sourceBlob": "5c7aeaa5a5da8e22a2406f36b55e9ef55e9aef83",
           "deliveryBlob": "5c7aeaa5a5da8e22a2406f36b55e9ef55e9aef83",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:lua/pay_kit/util/uint.lua",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:lua/pay_kit/util/uint.lua",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:lua/pay_kit/util/uint.lua",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -5145,7 +5145,7 @@
           "sourceBlob": "2b2d19ce3121f2e49e0d5260c526437706ce3a40",
           "deliveryBlob": "2b2d19ce3121f2e49e0d5260c526437706ce3a40",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:lua/tests/solana_verify_spec.lua",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:lua/tests/solana_verify_spec.lua",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:lua/tests/solana_verify_spec.lua",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -5439,7 +5439,7 @@
           "sourceBlob": "f5ee2cd6cac9eb578a8ad2981a0e601a607671ab",
           "deliveryBlob": "f5ee2cd6cac9eb578a8ad2981a0e601a607671ab",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:playground/package.json",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:playground/package.json",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:playground/package.json",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -5465,7 +5465,7 @@
           "sourceBlob": "e4fc7d65cc3c7585d2c0fc7ff09b4ada0813812f",
           "deliveryBlob": "e4fc7d65cc3c7585d2c0fc7ff09b4ada0813812f",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:playground/pnpm-lock.yaml",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:playground/pnpm-lock.yaml",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:playground/pnpm-lock.yaml",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -5491,7 +5491,7 @@
           "sourceBlob": "591dc3077f974f9fcf2fe66cf6452f0ad3d76ac4",
           "deliveryBlob": "591dc3077f974f9fcf2fe66cf6452f0ad3d76ac4",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:playground/pnpm-workspace.yaml",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:playground/pnpm-workspace.yaml",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:playground/pnpm-workspace.yaml",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -5915,7 +5915,7 @@
           "sourceBlob": "65e876e0eff00e44f3fc20739fc4a1d0c92862bf",
           "deliveryBlob": "65e876e0eff00e44f3fc20739fc4a1d0c92862bf",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:ruby/lib/pay_kit/protocols/mpp/protocol/core/headers.rb",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:ruby/lib/pay_kit/protocols/mpp/protocol/core/headers.rb",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:ruby/lib/pay_kit/protocols/mpp/protocol/core/headers.rb",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -6019,7 +6019,7 @@
           "sourceBlob": "a328d71b1a941e1666595e79f923a27aecd7c483",
           "deliveryBlob": "a328d71b1a941e1666595e79f923a27aecd7c483",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:ruby/test/pay_kit/protocols/mpp/core_test.rb",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:ruby/test/pay_kit/protocols/mpp/core_test.rb",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:ruby/test/pay_kit/protocols/mpp/core_test.rb",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -6045,7 +6045,7 @@
           "sourceBlob": "6aeddef7a2d4353dd4853c6518ba139adf35ee64",
           "deliveryBlob": "6aeddef7a2d4353dd4853c6518ba139adf35ee64",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:ruby/test/pay_kit/protocols/mpp/pull_mode_replay_test.rb",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:ruby/test/pay_kit/protocols/mpp/pull_mode_replay_test.rb",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:ruby/test/pay_kit/protocols/mpp/pull_mode_replay_test.rb",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -6765,7 +6765,7 @@
           "sourceBlob": "0d19562cb7903763e7aab33064f6282a5da8256a",
           "deliveryBlob": "0d19562cb7903763e7aab33064f6282a5da8256a",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:skills/pay-sdk-implementation/codegen/generate-payment-channels-client-py.ts",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:skills/pay-sdk-implementation/codegen/generate-payment-channels-client-py.ts",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:skills/pay-sdk-implementation/codegen/generate-payment-channels-client-py.ts",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -6807,7 +6807,7 @@
           "sourceBlob": "5ed0b5af0d45919f64c66edfb16a5f4512461fa1",
           "deliveryBlob": "5ed0b5af0d45919f64c66edfb16a5f4512461fa1",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:skills/pay-sdk-implementation/codegen/pnpm-workspace.yaml",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:skills/pay-sdk-implementation/codegen/pnpm-workspace.yaml",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:skills/pay-sdk-implementation/codegen/pnpm-workspace.yaml",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -7007,7 +7007,7 @@
           "sourceBlob": "401b29a025906cb538cd6d54ac169200f91bd440",
           "deliveryBlob": "401b29a025906cb538cd6d54ac169200f91bd440",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:typescript/package.json",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:typescript/package.json",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:typescript/package.json",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
@@ -8083,7 +8083,7 @@
           "sourceBlob": "7ef901638d1f40c7361aa2b81d0ad25f81ea5d6f",
           "deliveryBlob": "7ef901638d1f40c7361aa2b81d0ad25f81ea5d6f",
           "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:typescript/pnpm-workspace.yaml",
-          "deliveryRef": "96f8fee430c2c06101bae4df674256f72c2df946:typescript/pnpm-workspace.yaml",
+          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:typescript/pnpm-workspace.yaml",
           "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
         },
         {
