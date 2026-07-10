@@ -454,16 +454,13 @@ describe('session() verify() topUp', () => {
     });
 
     test('topUp atomically rejects a concurrent duplicate signature', async () => {
-        const store = {
-            ...createMemorySessionStore(),
-            sessionStoreDurability: 'durable-shared' as const,
-        };
+        const store = createMemorySessionStore();
         const signer = await generateKeyPairSigner();
         const method = session({
             cap: 5_000_000n,
             currency: 'USDC',
             decimals: 6,
-            network: 'devnet',
+            network: 'localnet',
             operator: OPERATOR,
             pricing: {},
             recipient: RECIPIENT,
