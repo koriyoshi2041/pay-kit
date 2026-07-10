@@ -172,18 +172,11 @@ jobs:
         run: |
           pnpm exec vitest run test/e2e.test.ts --testTimeout 180000 --reporter=default --reporter=json --outputFile=vitest-report.json
           node scripts/assert-run-count.mjs --report vitest-report.json --exact 1
-      - name: Focused Python session fault-injection (missing-ATA, known-red)
+      - name: Focused Python session fault-injection (missing-ATA)
         working-directory: harness
-        # RED-EXPECTED, non-blocking. Pins the missing-ATA-creation finding: the
-        # SDK session close builds [ed25519, settle, distribute] and, unlike the
-        # x402-upto settle path, omits the idempotent payee-ATA creation. A close
-        # to a recipient with no ATA returns 200 + settledSignature yet delivers
-        # nothing on-chain (recipient stays 0, no ATA created). Gated behind
-        # MPP_HARNESS_SESSION_RED_FAULTS so it never contaminates the green
-        # must-pass leg above; continue-on-error surfaces it as a non-blocking red
-        # annotation until the session close creates the payee ATA or rejects
-        # clearly.
-        continue-on-error: true
+        # The close transaction creates every payout ATA idempotently before
+        # distribute. A missing primary recipient ATA must therefore settle
+        # successfully and deliver funds; a regression is release-blocking.
         env:
           MPP_HARNESS_INTENTS: session
           MPP_HARNESS_SCENARIOS: session-basic

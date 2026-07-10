@@ -41,7 +41,7 @@ jobs:
           SEMGREP_ENFORCE: ${{ inputs.enforce && '1' || '0' }}
         run: |
           set +e
-          SEMGREP_ERROR_ON_FINDINGS=1 docker run --rm -v "$PWD:/src" -w /src semgrep/semgrep@sha256:59fbed6127ea7c5dde3ba6a85142733bb20ea9aaa36120c953904f1539aaf66e bash harness/semgrep/run.sh typescript go python
+          docker run --rm -e SEMGREP_ERROR_ON_FINDINGS=1 -v "$PWD:/src" -w /src semgrep/semgrep@sha256:59fbed6127ea7c5dde3ba6a85142733bb20ea9aaa36120c953904f1539aaf66e bash harness/semgrep/run.sh typescript go python
           status=$?
           set -e
           if [ "$status" -ne 0 ]; then

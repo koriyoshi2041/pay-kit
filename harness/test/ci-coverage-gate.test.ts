@@ -236,4 +236,18 @@ describe("workflow hygiene gate: direct non-publish workflows are read-only by d
     expect(source).not.toMatch(/pip install semgrep/);
     expect(source).toMatch(/SEMGREP_ERROR_ON_FINDINGS=1/);
   });
+
+  it("keeps the repaired missing-ATA settlement regression blocking", () => {
+    for (const workflow of ["python.yml", "harness.yml"]) {
+      const source = readFileSync(join(workflowsDir, workflow), "utf8");
+      const step = source.match(
+        /- name: Focused Python session fault-injection \(missing-ATA\)([\s\S]*?)(?=\n\s*- name:|$)/,
+      )?.[1];
+      expect(step, `${workflow} missing-ATA step`).toBeTruthy();
+      expect(step, `${workflow} missing-ATA step must not swallow fund-loss failures`).not.toMatch(
+        /continue-on-error:\s*true/,
+      );
+      expect(step).toMatch(/MPP_HARNESS_SESSION_RED_FAULTS:\s*"1"/);
+    }
+  });
 });
