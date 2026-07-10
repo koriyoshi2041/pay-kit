@@ -216,7 +216,8 @@ export async function configure(params: ConfigureParams = {}): Promise<PayKitCon
         ? resolveChallengeBindingSecret(network, params.mpp?.challengeBindingSecret)
         : (params.mpp?.challengeBindingSecret ?? '');
 
-    const allowUnsafeMemoryStore = params.mpp?.allowUnsafeMemoryStore ?? false;
+    const allowUnsafeMemoryStore =
+        params.mpp?.allowUnsafeMemoryStore ?? process.env.PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE === '1';
     let replayStore: Store.Store | undefined = params.replayStore;
     if (accept.includes('mpp')) {
         if (replayStore === undefined && allowUnsafeMemoryStore) {
