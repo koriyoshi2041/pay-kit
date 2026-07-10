@@ -11,7 +11,7 @@ const currentHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, enco
 
 const deliveries = {
     214: ['fix/go-idiomatic-cleanup', '92bdcbf'],
-    227: ['fix/rust-security-hardening', '515398b'],
+    227: ['fix/rust-security-hardening', '205b3d8'],
     228: ['fix/python-security-hardening', '8ac54e8'],
     229: ['fix/php-security-hardening', '0bd30c1'],
     230: ['fix/kotlin-canonical-json-hardening', 'd286dd9'],
@@ -88,14 +88,14 @@ function markOpen(record, prs, label) {
 }
 
 for (const record of ledger.commits) {
-    if (record.status !== 'missing') continue;
+    if (record.status !== 'missing' && record.status !== 'open_pr') continue;
     const owners = commitOwners.get(record.sha.slice(0, 7));
     if (!owners) throw new Error(`missing commit owner: ${record.sha}`);
     markOpen(record, owners, `Source commit ${record.sha}`);
 }
 
 for (const record of ledger.paths) {
-    if (record.status === 'missing') {
+    if (record.status === 'missing' || record.status === 'open_pr') {
         markOpen(record, ownersForPath(record.path, record.bucket), `Source path ${record.path}`);
         continue;
     }
