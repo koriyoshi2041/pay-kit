@@ -346,9 +346,9 @@ const sourceContractProbes: SourceContractProbe[] = [
       },
       {
         file: "rust/crates/kit/src/core/store.rs",
-        mechanism: "makes undeclared custom stores unsafe by default",
+        mechanism: "maps only explicitly shared legacy stores to durable shared capability",
         pattern:
-          /fn replay_store_capability\(&self\) -> ReplayStoreCapability\s*\{\s*ReplayStoreCapability::Unspecified/,
+          /fn replay_store_capability\(&self\) -> ReplayStoreCapability\s*\{[\s\S]*?if self\.is_shared\(\)[\s\S]*?ReplayStoreCapability::DurableShared[\s\S]*?ReplayStoreCapability::Unspecified/,
       },
       {
         file: "rust/crates/kit/src/core/store.rs",
@@ -358,15 +358,15 @@ const sourceContractProbes: SourceContractProbe[] = [
       },
       {
         file: "rust/crates/kit/src/mpp/server/charge.rs",
-        mechanism: "requires a durable shared replay store outside localnet",
+        mechanism: "requires a durable shared replay store unless explicitly unsafe",
         pattern:
-          /config\.network != "localnet"\s*&&\s*store\.replay_store_capability\(\) != ReplayStoreCapability::DurableShared/,
+          /store\.replay_store_capability\(\) != ReplayStoreCapability::DurableShared[\s\S]*?&& !config\.allow_unsafe_memory_store/,
       },
       {
         file: "rust/crates/kit/src/mpp/server/charge.rs",
-        mechanism: "permits the memory-store fallback only on localnet",
+        mechanism: "permits memory fallback only through the explicit unsafe opt-in",
         pattern:
-          /None if config\.network == "localnet"\s*=>\s*Arc::new\(MemoryStore::new\(\)\),[\s\S]*?Config\.store is required outside localnet/,
+          /None if config\.allow_unsafe_memory_store\s*=>[\s\S]*?Arc::new\(MemoryStore::new\(\)\),[\s\S]*?None\s*=>[\s\S]*?atomic durable shared replay store is required/,
       },
       {
         file: "rust/crates/kit/src/mpp/server/session.rs",
@@ -390,7 +390,7 @@ const sourceContractProbes: SourceContractProbe[] = [
         file: "php/src/Store/MemoryStore.php",
         mechanism: "marks the built-in memory store as not durable and shared",
         pattern:
-          /class MemoryStore implements Store, ReplayStoreCapability[\s\S]*?function providesDurableSharedReplayProtection\(\): bool[\s\S]*?return false;/,
+          /class MemoryStore implements [^{]*ReplayStoreCapability[\s\S]*?function providesDurableSharedReplayProtection\(\): bool[\s\S]*?return false;/,
       },
       {
         file: "php/src/Store/FileStore.php",
@@ -400,21 +400,21 @@ const sourceContractProbes: SourceContractProbe[] = [
       },
       {
         file: "php/src/Protocols/Mpp/Adapter.php",
-        mechanism: "rejects an absent MPP replay store outside localnet",
+        mechanism: "rejects an absent MPP replay store without explicit unsafe opt-in",
         pattern:
-          /\$config->network !== Network::SolanaLocalnet[\s\S]*?MPP replayStore is required outside localnet/,
+          /if \(\$replayStore === null\)[\s\S]*?MPP requires an injected atomic durable\/shared replay store/,
       },
       {
         file: "php/src/Protocols/Mpp/Adapter.php",
         mechanism: "rejects a replay store without the durable shared capability",
         pattern:
-          /!\$replayStore instanceof ReplayStoreCapability[\s\S]*?!\$replayStore->providesDurableSharedReplayProtection\(\)[\s\S]*?must explicitly declare durable shared replay protection outside localnet/,
+          /!\$replayStore instanceof ReplayStoreCapability[\s\S]*?!\$replayStore->providesDurableSharedReplayProtection\(\)[\s\S]*?does not affirm durable\/shared capability/,
       },
       {
         file: "php/src/Protocols/Mpp/Server/SolanaChargeHandler.php",
-        mechanism: "enforces the same non-localnet guard on direct handler construction",
+        mechanism: "enforces the same shared-capability guard on direct handler construction",
         pattern:
-          /\$network !== 'localnet'[\s\S]*?!\$replayStore instanceof ReplayStoreCapability[\s\S]*?must explicitly declare durable shared replay protection outside localnet/,
+          /!\$replayStore instanceof ReplayStoreCapability[\s\S]*?!\$replayStore->providesDurableSharedReplayProtection\(\)[\s\S]*?does not affirm durable\/shared capability/,
       },
     ],
   },
