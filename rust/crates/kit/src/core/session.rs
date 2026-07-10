@@ -6,7 +6,7 @@
 //! committed atomically against a [`ChannelStore`]. Both protocol crates map
 //! their own wire voucher type onto this.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::core::store::{ChannelState, ChannelStore, StoreError};
@@ -131,7 +131,6 @@ pub async fn accept_voucher(
         settlement_window,
     )?;
 
-    let prior_cumulative = state.cumulative;
     let sig = signature_b58.to_string();
     // The authoritative replay decision is made under the store lock: if another
     // writer landed this exact voucher first, the in-lock branch below treats it
@@ -140,6 +139,8 @@ pub async fn accept_voucher(
     // cannot serve the same paid request twice.
     let replayed = Arc::new(AtomicBool::new(false));
     let replayed_cl = Arc::clone(&replayed);
+    let committed_delta = Arc::new(AtomicU64::new(0));
+    let committed_delta_cl = Arc::clone(&committed_delta);
     let new_state = store
         .update_channel(
             channel_id,
@@ -160,6 +161,7 @@ pub async fn accept_voucher(
                     && state.highest_voucher_signature.as_deref() == Some(&sig)
                 {
                     replayed_cl.store(true, Ordering::SeqCst);
+                    committed_delta_cl.store(0, Ordering::SeqCst);
                     return Ok(state);
                 }
                 if new_cumulative <= state.cumulative {
@@ -167,9 +169,22 @@ pub async fn accept_voucher(
                         "Concurrent update: watermark advanced".to_string(),
                     ));
                 }
+                if new_cumulative > state.deposit {
+                    return Err(StoreError::Internal(format!(
+                        "Voucher cumulative {new_cumulative} exceeds deposit {}",
+                        state.deposit
+                    )));
+                }
+                let delta = new_cumulative - state.cumulative;
+                if min_voucher_delta > 0 && delta < min_voucher_delta {
+                    return Err(StoreError::Internal(format!(
+                        "Voucher delta {delta} is below minimum {min_voucher_delta}"
+                    )));
+                }
                 // Set on every committing run so a retried closure (e.g. a
                 // CAS-based store) reflects the final decision, not an earlier one.
                 replayed_cl.store(false, Ordering::SeqCst);
+                committed_delta_cl.store(delta, Ordering::SeqCst);
                 Ok(ChannelState {
                     cumulative: new_cumulative,
                     highest_voucher_signature: Some(sig),
@@ -184,11 +199,7 @@ pub async fn accept_voucher(
     let was_replay = replayed.load(Ordering::SeqCst);
     Ok(VoucherAcceptance {
         cumulative: new_state.cumulative,
-        charged: if was_replay {
-            0
-        } else {
-            new_state.cumulative.saturating_sub(prior_cumulative)
-        },
+        charged: committed_delta.load(Ordering::SeqCst),
         replay: was_replay,
     })
 }

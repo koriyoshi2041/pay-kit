@@ -4,9 +4,13 @@ declare(strict_types=1);
 
 namespace PayKit\Protocols\X402;
 
+use Brick\Math\BigInteger;
+use Brick\Math\Exception\RoundingNecessaryException;
 use PayKit\Config;
+use PayKit\Exception\ConfigurationException;
 use PayKit\Exception\InvalidProofException;
 use PayKit\Gate;
+use PayKit\PayCore\Network;
 use PayKit\Payment;
 use PayKit\Protocol;
 use PayKit\PayCore\Rpc\RpcGateway;
@@ -91,23 +95,39 @@ final class Adapter
                 . 'leave X402Config::$facilitatorUrl null for self-hosted',
             );
         }
-        if ($replayStore === null) {
-            self::warnDefaultReplayStore();
-            $replayStore = new MemoryStore();
-        }
-        $this->replayStore = $replayStore;
+        $this->replayStore = $replayStore ?? self::defaultReplayStore($config->network);
         $this->recentBlockhashProvider = $recentBlockhashProvider;
         $this->rpc = $rpc;
     }
 
-    private static function warnDefaultReplayStore(): void
+    /**
+     * Resolve the fallback replay store when the caller passed none.
+     *
+     * The in-memory default is only safe on localnet (single-process dev). Off
+     * localnet it is a replay hole: markers are process-local, so a restart or a
+     * second worker/replica would accept a replayed settlement. Fail closed
+     * unless `PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1` acknowledges single-process
+     * scope. Mirrors the MPP adapter guard.
+     */
+    private static function defaultReplayStore(Network $network): Store
     {
-        if (function_exists('error_log')) {
-            error_log(
-                'pay_kit: WARN: x402 adapter using in-memory replay store; '
-                . 'dev-only. Inject a shared atomic Store (Redis/Postgres) in production.',
+        $allowInMemory = getenv('PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE') === '1';
+        if ($network !== Network::SolanaLocalnet && !$allowInMemory) {
+            throw new ConfigurationException(
+                'pay_kit: a shared replay store is required outside localnet. The default in-memory '
+                . 'store is process-local, so a second replica or a restart would accept a replayed '
+                . 'settlement. Inject a shared, persistent Store (ideally one with an atomic reserve, '
+                . 'e.g. Redis SET NX) into the x402 adapter, or set '
+                . 'PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1 to acknowledge single-process replay scope.',
             );
         }
+        if ($network !== Network::SolanaLocalnet && function_exists('error_log')) {
+            error_log(
+                'pay_kit: WARN: x402 adapter using in-memory replay store off localnet '
+                . '(PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1); replay protection is process-local.',
+            );
+        }
+        return new MemoryStore();
     }
 
     private function rpc(): RpcGateway
@@ -130,7 +150,7 @@ final class Adapter
         $asset = \PayKit\PayCore\Solana\Mints::resolve($coin, $this->config->network->mintsLabel()) ?? $coin;
         $tokenProgram = \PayKit\PayCore\Solana\Mints::tokenProgramFor($coin, $this->config->network->mintsLabel());
         $payTo = $gate->payTo ?? $this->config->effectiveRecipient();
-        $amount = (string) $gate->total()->amount->multipliedBy(1_000_000)->toInt();
+        $amount = self::exactBaseUnits($gate);
         $signer = $this->config->effectiveX402Signer();
         $extra = [
             'feePayer'     => $signer?->pubkey() ?? '',
@@ -160,6 +180,32 @@ final class Adapter
             'maxTimeoutSeconds' => 60,
             'extra'             => $extra,
         ];
+    }
+
+    /**
+     * Convert the gate total to an exact unsigned u64 wire value.
+     *
+     * JSON can represent native PHP integers exactly through ``PHP_INT_MAX``.
+     * Above that boundary keep the decimal form as a string, which preserves
+     * the full u64 value without asking a JSON consumer to round it.
+     */
+    private static function exactBaseUnits(Gate $gate): int|string
+    {
+        try {
+            $amount = $gate->total()->amount->multipliedBy(1_000_000)->toBigInteger();
+        } catch (RoundingNecessaryException $e) {
+            throw new ConfigurationException(
+                'pay_kit: x402 amount has more precision than the token supports',
+                previous: $e,
+            );
+        }
+        if ($amount->isNegative() || $amount->isGreaterThan(BigInteger::of('18446744073709551615'))) {
+            throw new ConfigurationException('pay_kit: x402 amount must fit an unsigned u64');
+        }
+        if ($amount->isLessThanOrEqualTo(BigInteger::of(PHP_INT_MAX))) {
+            return $amount->toInt();
+        }
+        return (string) $amount;
     }
 
     private function fetchRecentBlockhash(): ?string

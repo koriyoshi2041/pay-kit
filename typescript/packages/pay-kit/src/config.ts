@@ -4,6 +4,7 @@ import type { Store } from 'mppx';
 import { ConfigurationError, DemoSignerOnMainnetError, ProtocolNotSupportedError } from './errors.js';
 import { type Stablecoin, STABLECOINS } from './price.js';
 import { type Network, type NetworkSlug, type Protocol, toNetwork, toSolanaNetwork } from './protocol.js';
+import { createMemoryReplayStore, isReservingReplayStore } from './replay-store.js';
 import { type KeychainSigner, type PayKitSigner, Signer } from './signer.js';
 
 /** MPP protocol options. */
@@ -88,6 +89,29 @@ export type PayKitConfig = {
 
 const DEFAULT_EXPIRES_IN_SECONDS = 120;
 
+function resolveReplayStore(network: Network, provided: Store.Store | undefined, requireAtomic: boolean): Store.Store {
+    if (provided !== undefined) {
+        if (requireAtomic && !isReservingReplayStore(provided)) {
+            throw new ConfigurationError(
+                'x402 replayStore must provide an atomic reserve(key, value, ttlSeconds) operation.',
+            );
+        }
+        return provided;
+    }
+    const allowInMemory = process.env.PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE === '1';
+    if (network !== 'solana_localnet' && !allowInMemory) {
+        throw new ConfigurationError(
+            'replayStore is required outside localnet. Pass a shared persistent store with an atomic ' +
+                'reserve operation, or set PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1 to acknowledge ' +
+                'single-process replay scope.',
+        );
+    }
+    if (network !== 'solana_localnet') {
+        console.warn('[pay-kit] Using an in-memory replay store off localnet. Replay protection is process-local.');
+    }
+    return createMemoryReplayStore();
+}
+
 function resolveChallengeBindingSecret(network: Network, provided: string | undefined): string {
     const secret = provided ?? process.env.PAY_KIT_MPP_SECRET ?? process.env.MPP_SECRET_KEY;
     if (secret) return secret;
@@ -170,6 +194,11 @@ export async function configure(params: ConfigureParams = {}): Promise<PayKitCon
         ? resolveChallengeBindingSecret(network, params.mpp?.challengeBindingSecret)
         : (params.mpp?.challengeBindingSecret ?? '');
 
+    const replayStore =
+        accept.includes('mpp') || accept.includes('x402')
+            ? resolveReplayStore(network, params.replayStore, accept.includes('x402'))
+            : params.replayStore;
+
     return Object.freeze({
         accept: Object.freeze([...accept]),
         mpp: Object.freeze({
@@ -181,7 +210,7 @@ export async function configure(params: ConfigureParams = {}): Promise<PayKitCon
         network,
         operator: Object.freeze(operator),
         preflight: params.preflight ?? true,
-        replayStore: params.replayStore,
+        replayStore,
         rpcUrl: params.rpcUrl ?? DEFAULT_RPC_URLS[toSolanaNetwork(network)] ?? DEFAULT_RPC_URLS.mainnet,
         stablecoins: Object.freeze([...stablecoins]),
         x402: Object.freeze({}),

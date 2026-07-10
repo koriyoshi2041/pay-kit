@@ -12,9 +12,12 @@
 //! v1: fixed per-request price; explicit operator-driven settlement (no
 //! automatic cron / forced-close watchdog yet).
 
+use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use tokio::sync::Mutex as AsyncMutex;
 
 use solana_keychain::SolanaSigner;
 use solana_message::Message;
@@ -42,6 +45,7 @@ use crate::x402::protocol::schemes::exact::{
 use crate::x402::server::upto::{
     cosign_operator_fee_payer, decode_transaction, validate_open_instruction,
 };
+use crate::x402::server::MAX_PAYMENT_SIGNATURE_HEADER_LEN;
 use crate::x402::{PAYMENT_REQUIRED_HEADER, PAYMENT_RESPONSE_HEADER, X402_VERSION_V2};
 
 /// `ChannelStatus::Open` discriminant in the generated client.
@@ -132,11 +136,103 @@ pub struct X402BatchSettlement {
     config: BatchConfig,
     operator: Pubkey,
     store: Arc<dyn ChannelStore>,
+    /// Per-channel serialization gates. A voucher acceptance must decide `serve`
+    /// on the watermark delta it actually *commits*, not on a watermark read
+    /// before the commit. Two concurrent vouchers on one channel would otherwise
+    /// each read the same stale watermark, both compute a `>= price` delta from
+    /// it, and both be served while only the larger cumulative is committed —
+    /// under-paying for one served request. Holding this per-channel gate across
+    /// the read → price-gate → accept span serializes those requests so the read
+    /// is the in-lock prior watermark and the committed delta is authoritative.
+    ///
+    /// Entries are refcounted and evicted once no holder or waiter remains
+    /// (see [`X402BatchSettlement::voucher_gate`] / [`VoucherGate`]), so an
+    /// unauthenticated client posting vouchers with random channel ids cannot
+    /// grow this map without bound.
+    voucher_gates: Arc<Mutex<HashMap<String, GateEntry>>>,
+    /// Test-only seam: fires in `process_deposit` after the fresh channel is
+    /// written (`put_channel`, watermark 0) but before the first voucher is
+    /// accepted — the exact window a concurrent voucher must not be able to
+    /// interleave into. A test parks the deposit here and drives a concurrent
+    /// voucher's acceptance to prove the deposit holds the per-channel gate
+    /// across the watermark write and the first accept.
+    #[cfg(test)]
+    post_put_hook: Arc<Mutex<Option<PreGateHook>>>,
+    /// Test-only seam: fires in `process_voucher` after the in-lock prior
+    /// watermark (`prev`) is read but before the price gate and accept — i.e.
+    /// with the per-channel gate held. A test parks a voucher here (holding the
+    /// gate) so a concurrent voucher on the same channel is forced to wait,
+    /// proving the gate serializes the read → price-gate → accept span. When the
+    /// gate lock is removed the concurrent voucher instead interleaves and reads
+    /// the same stale watermark, changing the serve outcome.
+    #[cfg(test)]
+    post_read_hook: Arc<Mutex<Option<PreGateHook>>>,
+}
+
+/// A refcounted per-channel serialization gate entry. `refs` counts holders plus
+/// waiters and is guarded by [`X402BatchSettlement::voucher_gates`]'s outer
+/// `Mutex`, so the last releaser observing `refs == 0` can evict the map entry.
+struct GateEntry {
+    lock: Arc<AsyncMutex<()>>,
+    refs: usize,
+}
+
+/// Guard returned by [`X402BatchSettlement::voucher_gate`]. Holds the acquired
+/// `Arc<AsyncMutex>` so the caller can `.lock().await` it, and on drop
+/// decrements the entry's refcount under the map lock — evicting the entry once
+/// no holder or waiter remains. Mirrors Go's acquireChannelLock /
+/// releaseChannelLock so the gate map stays bounded by the number of
+/// concurrently active channels rather than every channel id ever seen.
+struct VoucherGate {
+    gates: Arc<Mutex<HashMap<String, GateEntry>>>,
+    channel_id: String,
+    lock: Arc<AsyncMutex<()>>,
+}
+
+impl VoucherGate {
+    /// The `Arc<AsyncMutex>` to `.lock().await` for the serialized section.
+    fn lock(&self) -> &Arc<AsyncMutex<()>> {
+        &self.lock
+    }
+}
+
+impl Drop for VoucherGate {
+    fn drop(&mut self) {
+        let mut gates = self.gates.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = gates.get_mut(&self.channel_id) {
+            entry.refs -= 1;
+            // Evict only when this is still the same entry we bumped — a late
+            // acquirer that recreated the entry after eviction owns a distinct
+            // `Arc`, so compare by pointer identity before deleting.
+            if entry.refs == 0 && Arc::ptr_eq(&entry.lock, &self.lock) {
+                gates.remove(&self.channel_id);
+            }
+        }
+    }
+}
+
+/// Test-only seam payload for the `post_put_hook` / `post_read_hook` seams: the
+/// call that consumes the hook signals `entered` (so the test knows it reached
+/// the seam) and then parks on `release` until the test drops its guard.
+#[cfg(test)]
+struct PreGateHook {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: Arc<AsyncMutex<()>>,
 }
 
 impl X402BatchSettlement {
     /// Build a handler with an in-memory channel store.
     pub fn new(config: BatchConfig) -> Result<Self, Error> {
+        let localnet = matches!(
+            config.cluster.trim().to_ascii_lowercase().as_str(),
+            "localnet" | "solana_localnet"
+        );
+        if !localnet && std::env::var("PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE").as_deref() != Ok("1") {
+            return Err(Error::Other(
+                "non-localnet x402 batch settlement requires a shared channel store; use X402BatchSettlement::with_store or set PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1 to acknowledge process-local replay protection"
+                    .into(),
+            ));
+        }
         Self::with_store(config, Arc::new(MemoryChannelStore::new()))
     }
 
@@ -157,7 +253,77 @@ impl X402BatchSettlement {
             config,
             operator,
             store,
+            voucher_gates: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            post_put_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            post_read_hook: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Acquire (or create) the per-channel serialization gate for `channel_id`,
+    /// bumping its refcount so a concurrent releaser cannot evict the entry
+    /// while this caller is still queued on it. Returns a [`VoucherGate`] guard
+    /// that decrements the refcount on drop and evicts the entry once idle, so
+    /// the gate map never grows with channel ids that no request currently
+    /// holds. The caller `.lock().await`s the returned guard for the serialized
+    /// section. The (potentially contended) async lock is taken outside the
+    /// outer map `Mutex`, so the `std::sync::Mutex` is never held across `.await`.
+    fn voucher_gate(&self, channel_id: &str) -> VoucherGate {
+        let lock = {
+            let mut gates = self.voucher_gates.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = gates
+                .entry(channel_id.to_string())
+                .or_insert_with(|| GateEntry {
+                    lock: Arc::new(AsyncMutex::new(())),
+                    refs: 0,
+                });
+            entry.refs += 1;
+            entry.lock.clone()
+        };
+        VoucherGate {
+            gates: self.voucher_gates.clone(),
+            channel_id: channel_id.to_string(),
+            lock,
+        }
+    }
+
+    /// Atomically create the persisted channel state without replacing an
+    /// already-open channel. A retry of the same confirmed open is idempotent;
+    /// a conflicting state is rejected instead of resetting its watermark.
+    async fn create_channel_if_absent(
+        &self,
+        channel_id: &str,
+        expected: ChannelState,
+    ) -> Result<bool, Error> {
+        let created = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let created_in_update = Arc::clone(&created);
+        self.store
+            .update_channel(
+                channel_id,
+                Box::new(move |existing| match existing {
+                    None => {
+                        created_in_update.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(expected)
+                    }
+                    Some(state)
+                        if state.channel_id == expected.channel_id
+                            && state.authorized_signer == expected.authorized_signer
+                            && state.deposit == expected.deposit
+                            && state.open_slot == expected.open_slot
+                            && state.operator == expected.operator =>
+                    {
+                        created_in_update.store(false, std::sync::atomic::Ordering::SeqCst);
+                        Ok(state)
+                    }
+                    Some(_) => Err(StoreError::Internal(
+                        "existing channel state does not match confirmed open".to_string(),
+                    )),
+                }),
+            )
+            .await
+            .map_err(|e| Error::Other(format!("store error: {e}")))?;
+        Ok(created.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Operator/facilitator pubkey (base58).
@@ -292,6 +458,16 @@ impl X402BatchSettlement {
     /// Decode a `PAYMENT-SIGNATURE` header into a `batch-settlement` payload.
     pub fn parse_payment(&self, header: &str) -> Result<BatchPayload, Error> {
         use crate::x402::protocol::schemes::batch_settlement::BatchSignatureEnvelope;
+        // Cap the header before any base64 / JSON work, matching the `exact` and
+        // `upto` parsers' 16 KiB `MAX_PAYMENT_SIGNATURE_HEADER_LEN`. A
+        // batch-settlement header additionally embeds a full base64 transaction,
+        // so without this an oversized credential header drives proportionally
+        // larger decode + parse work.
+        if header.len() > MAX_PAYMENT_SIGNATURE_HEADER_LEN {
+            return Err(Error::InvalidPaymentRequired(format!(
+                "PAYMENT-SIGNATURE header exceeds maximum length of {MAX_PAYMENT_SIGNATURE_HEADER_LEN} bytes"
+            )));
+        }
         let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, header)
             .map_err(|e| Error::InvalidPaymentRequired(e.to_string()))?;
         let envelope: BatchSignatureEnvelope = serde_json::from_slice(&decoded)
@@ -472,42 +648,73 @@ impl X402BatchSettlement {
         }
 
         let channel_b58 = pc::pubkey_string(&channel_id);
-        self.store
-            .put_channel(
-                &channel_b58,
-                ChannelState {
-                    channel_id: channel_b58.clone(),
-                    authorized_signer: pc::pubkey_string(&authorized_signer),
-                    deposit: channel.deposit,
-                    cumulative: 0,
-                    sealed: false,
-                    highest_voucher_signature: None,
-                    highest_voucher_expires_at: None,
-                    close_requested_at: None,
-                    // Persisted for PDA re-derivation and the reclaim gate.
-                    open_slot: Some(open_slot),
-                    // Stash the payer here so settlement/distribute can refund it
-                    // without an extra account fetch.
-                    operator: Some(pc::pubkey_string(&payer)),
-                    next_delivery_sequence: 0,
-                    pending_deliveries: vec![],
-                    committed_deliveries: vec![],
-                },
-            )
-            .await
-            .map_err(|e| Error::Other(format!("store error: {e}")))?;
 
-        // Accept the first voucher (if any) off-chain. The channel was just
-        // created at cumulative 0, so the first voucher is always a fresh charge
-        // (never a replay) — surface the charged amount.
-        let charged = if let Some(v) = voucher {
-            Some(self.accept(&channel_b58, &v).await?.charged)
-        } else {
-            None
+        // Serialize the watermark write and the first-voucher accept under the
+        // per-channel gate. Without holding it, a concurrent `process_voucher`
+        // could acquire the gate, read this fresh channel's watermark (0), pass
+        // the price gate and commit a larger cumulative between our `put_channel`
+        // and our first accept — leaving both the deposit and the voucher served
+        // for a combined committed delta below two requests' price. Holding the
+        // gate across both makes the deposit's write and first accept atomic with
+        // respect to concurrent voucher acceptances on this channel.
+        let gate = self.voucher_gate(&channel_b58);
+        let _held = gate.lock().lock().await;
+
+        let expected_state = ChannelState {
+            channel_id: channel_b58.clone(),
+            authorized_signer: pc::pubkey_string(&authorized_signer),
+            deposit: channel.deposit,
+            cumulative: 0,
+            sealed: false,
+            highest_voucher_signature: None,
+            highest_voucher_expires_at: None,
+            close_requested_at: None,
+            // Persisted for PDA re-derivation and the reclaim gate.
+            open_slot: Some(open_slot),
+            // Stash the payer here so settlement/distribute can refund it
+            // without an extra account fetch.
+            operator: Some(pc::pubkey_string(&payer)),
+            next_delivery_sequence: 0,
+            pending_deliveries: vec![],
+            committed_deliveries: vec![],
         };
+        let created = self
+            .create_channel_if_absent(&channel_b58, expected_state)
+            .await?;
+
+        // Test-only seam: fires with the gate held, after the fresh channel is
+        // written but before the first voucher is accepted — the exact window a
+        // concurrent voucher must not be able to interleave into.
+        #[cfg(test)]
+        {
+            let hook = self
+                .post_put_hook
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(hook) = hook {
+                let _ = hook.entered.send(());
+                let _ = hook.release.lock().await;
+            }
+        }
+
+        // A retried open keeps the existing watermark. Its first voucher is
+        // therefore accepted idempotently (serve=false) or as a genuinely new
+        // paid increment; it can never reset cumulative to zero.
+        let (serve, charged) = if let Some(v) = voucher {
+            let acceptance = self.accept(&channel_b58, &v, per_request).await?;
+            (
+                !acceptance.replay && acceptance.charged >= per_request,
+                Some(acceptance.charged),
+            )
+        } else {
+            (created, None)
+        };
+        drop(_held);
+        drop(gate);
 
         Ok(BatchOutcome {
-            serve: true,
+            serve,
             response: BatchSettlementResponse {
                 success: true,
                 error_reason: None,
@@ -530,31 +737,43 @@ impl X402BatchSettlement {
         voucher: BatchVoucher,
         per_request: u64,
     ) -> Result<BatchOutcome, Error> {
-        let prev = self
-            .store
-            .get_channel(channel_id)
-            .await
-            .map_err(|e| Error::Other(format!("store error: {e}")))?
-            .map(|s| s.cumulative)
-            .unwrap_or(0);
-        // The voucher must pay at least the advertised price for this request.
-        // Checked before `accept` so an underpriced voucher — or an idempotent
-        // replay of the latest voucher (delta 0), which would otherwise serve
-        // the route again for free — is rejected without advancing the
-        // watermark.
-        if voucher.cumulative()?.saturating_sub(prev) < per_request {
-            return Err(Error::Other(format!(
-                "voucher charge {} is below the required {per_request}",
-                voucher.cumulative()?.saturating_sub(prev)
-            )));
+        // Serialize acceptances on this channel so the watermark that gates the
+        // price and the paid serve is the in-lock prior watermark this voucher
+        // commits against. Without this, two concurrent vouchers could both read
+        // the same stale watermark before either commits, both pass the price
+        // gate, and both be served while only the larger cumulative is committed
+        // — under-paying for one served request.
+        let gate = self.voucher_gate(channel_id);
+        let _held = gate.lock().lock().await;
+
+        // Test-only seam: fires while the handler-local gate is held and before
+        // the atomic store acceptance. It lets tests exercise local contention;
+        // the store transaction remains the cross-handler correctness boundary.
+        #[cfg(test)]
+        {
+            let hook = self
+                .post_read_hook
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(hook) = hook {
+                let _ = hook.entered.send(());
+                let _ = hook.release.lock().await;
+            }
         }
-        let acceptance = self.accept(channel_id, &voucher).await?;
+
+        // The store transaction computes the committed delta from its in-lock
+        // watermark and applies the price floor there. Handler-local gates only
+        // reduce contention; correctness therefore holds across independently
+        // constructed handlers and replicas sharing one atomic store.
+        let acceptance = self.accept(channel_id, &voucher, per_request).await?;
         let charged = acceptance.charged;
-        // An idempotent replay (charged == 0) is NOT a fresh paid serve: the
-        // route was already paid for on the original voucher. The price check
-        // above rejects replays whenever `per_request > 0`; this guards the
+        // A fresh paid serve requires committing at least one request's price and
+        // not being an idempotent replay. An idempotent replay (`replay == true`,
+        // delta 0) is NOT a fresh paid serve: the route was already paid for on
+        // the original voucher. The `!replay` clause also guards the
         // `per_request == 0` edge so a replay can never re-serve for free.
-        let serve = !acceptance.replay;
+        let serve = !acceptance.replay && charged >= per_request;
         let deposit = self
             .store
             .get_channel(channel_id)
@@ -590,6 +809,7 @@ impl X402BatchSettlement {
         &self,
         channel_id: &str,
         voucher: &BatchVoucher,
+        required_delta: u64,
     ) -> Result<VoucherAcceptance, Error> {
         let cumulative = voucher.cumulative()?;
         accept_voucher(
@@ -599,7 +819,7 @@ impl X402BatchSettlement {
             voucher.expires_at,
             &voucher.signature,
             now_unix(),
-            self.config.min_voucher_delta,
+            self.config.min_voucher_delta.max(required_delta),
             self.config.grace_period_seconds as i64,
         )
         .await
@@ -631,7 +851,7 @@ impl X402BatchSettlement {
         if cumulative > state.cumulative {
             // Advances the watermark: accept it so the final amount settles in
             // the close. `accept` verifies the signature against the signer.
-            self.accept(channel_id, &voucher).await?;
+            self.accept(channel_id, &voucher, 0).await?;
         } else {
             // Proof-of-ownership only (at or below the watermark — nothing to
             // advance): still verify the signature to authorize the close.
@@ -948,6 +1168,19 @@ mod tests {
         X402BatchSettlement::with_store(config, store).unwrap()
     }
 
+    #[test]
+    fn nonlocalnet_constructor_requires_explicit_channel_store() {
+        if std::env::var("PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE").as_deref() == Ok("1") {
+            return;
+        }
+        let config = BatchConfig::new(
+            "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY",
+            "devnet",
+            Arc::new(memory_signer(1)),
+        );
+        assert!(X402BatchSettlement::new(config).is_err());
+    }
+
     fn seeded_state(channel_id: &str, authorized_signer: &str, cumulative: u64) -> ChannelState {
         ChannelState {
             channel_id: channel_id.to_string(),
@@ -964,6 +1197,39 @@ mod tests {
             pending_deliveries: vec![],
             committed_deliveries: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn retried_open_does_not_reset_existing_cumulative() {
+        let owner = memory_signer(3);
+        let channel = Pubkey::new_unique();
+        let channel_b58 = pc::pubkey_string(&channel);
+        let signer = pc::pubkey_string(&owner.pubkey());
+        let store = Arc::new(MemoryChannelStore::new());
+        let mut existing = seeded_state(&channel_b58, &signer, 700);
+        existing.open_slot = Some(42);
+        existing.operator = Some("payer".to_string());
+        existing.highest_voucher_signature = Some("already-accepted".to_string());
+        store
+            .put_channel(&channel_b58, existing.clone())
+            .await
+            .unwrap();
+
+        let mut replayed_open = existing.clone();
+        replayed_open.cumulative = 0;
+        replayed_open.highest_voucher_signature = None;
+        let created = handler(store.clone())
+            .create_channel_if_absent(&channel_b58, replayed_open)
+            .await
+            .unwrap();
+
+        assert!(!created, "the repeated open must be an idempotent no-op");
+        let after = store.get_channel(&channel_b58).await.unwrap().unwrap();
+        assert_eq!(after.cumulative, existing.cumulative);
+        assert_eq!(
+            after.highest_voucher_signature, existing.highest_voucher_signature,
+            "an open replay must preserve cumulative and voucher replay state"
+        );
     }
 
     // A steady-state voucher whose delta is below the advertised price must be
@@ -1071,6 +1337,297 @@ mod tests {
                 .cumulative,
             100,
             "replay must not advance the watermark"
+        );
+    }
+
+    // ── Concurrency: the paid serve must be gated on the in-lock committed delta ─
+    //
+    // Two vouchers on one channel (cumulative 100 and 150, priced at 100, from a
+    // zero watermark) commit a combined delta of 150 — one-and-a-half requests'
+    // worth. Only one may be served. The bug: `process_voucher` decided `serve`
+    // from a watermark read *before* the commit, so both vouchers read the same
+    // stale `0`, both computed a `>= price` delta, and both were served while only
+    // 150 total was committed — the second request was served for 50.
+
+    // Deterministic regression guard that genuinely gates the per-channel lock.
+    //
+    // The seam parks voucher B (cumulative 150) *inside* the gate — after B has
+    // read the prior watermark (0) but before it accepts — so B holds the gate
+    // while parked. Voucher A (cumulative 100) then races on the same channel:
+    //
+    //   * With the gate: A blocks acquiring it. When B is released, B accepts
+    //     from prev 0 (150 >= price 100) and is served, then A acquires the gate,
+    //     reads the in-lock prior watermark of 150, and its increment (100 - 150
+    //     saturates to 0 < 100) is refused — exactly one request served.
+    //   * Without the gate lock: A does not block. It reads the same stale
+    //     watermark of 0, commits 100, and is served *concurrently* with B, which
+    //     also read 0 and commits 150 — two requests served for a combined 150.
+    //
+    // So deleting `let _held = gate.lock().lock().await` flips the served count
+    // from 1 to 2 and fails this test. `A` is given a bounded head start to reach
+    // (and, with the fix, block on) the gate before B is released; with the fix
+    // no sleep can unblock A, and without it A completes its in-memory accept in
+    // microseconds, so the outcome is deterministic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_voucher_not_served_when_gate_serializes_accept() {
+        let owner = memory_signer(7);
+        let channel = Pubkey::new_unique();
+        let channel_b58 = pc::pubkey_string(&channel);
+
+        let store = Arc::new(MemoryChannelStore::new());
+        store
+            .put_channel(
+                &channel_b58,
+                seeded_state(&channel_b58, &pc::pubkey_string(&owner.pubkey()), 0),
+            )
+            .await
+            .unwrap();
+        let h = handler(store.clone());
+
+        // Arm the in-lock seam: the voucher that takes it has already read the
+        // prior watermark and holds the gate; it signals `entered`, then parks on
+        // `release` until the test drops its guard.
+        let release = Arc::new(AsyncMutex::new(()));
+        let release_guard = release.clone().lock_owned().await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        *h.post_read_hook.lock().unwrap() = Some(PreGateHook {
+            entered: entered_tx,
+            release: release.clone(),
+        });
+
+        // Spawn B (cumulative 150). It acquires the gate, reads prev 0, consumes
+        // the seam, and parks — holding the gate.
+        let voucher_b = sign_voucher(&owner, &channel, 150, FAR_FUTURE)
+            .await
+            .unwrap();
+        let hb = h.clone();
+        let cb = channel_b58.clone();
+        let task_b = tokio::spawn(async move { hb.process_voucher(&cb, voucher_b, 100).await });
+
+        // Wait until B has reached the seam (so B, not A, holds it). Now A cannot
+        // consume the seam and runs straight through to commit cumulative 100.
+        entered_rx.await.unwrap();
+
+        // Spawn A (cumulative 100). With the gate it blocks on acquisition; the
+        // bounded sleep gives it time to either commit (no gate) or park on the
+        // lock (fix).
+        let voucher_a = sign_voucher(&owner, &channel, 100, FAR_FUTURE)
+            .await
+            .unwrap();
+        let (ha, ca) = (h.clone(), channel_b58.clone());
+        let task_a = tokio::spawn(async move { ha.process_voucher(&ca, voucher_a, 100).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Release B and join both.
+        drop(release_guard);
+        let outcome_b = task_b.await.unwrap();
+        let outcome_a = task_a.await.unwrap();
+
+        // Count paid serves. With the gate this is exactly 1; deleting the gate
+        // lock lets both A and B decide `serve` off the stale watermark of 0.
+        let served = [outcome_a, outcome_b]
+            .into_iter()
+            .flatten()
+            .filter(|o| o.serve)
+            .count();
+        assert_eq!(
+            served, 1,
+            "the per-channel gate must serialize accept so only one request is served"
+        );
+
+        // The channel advanced to 150 (B's cumulative), never past it.
+        assert_eq!(
+            store
+                .get_channel(&channel_b58)
+                .await
+                .unwrap()
+                .unwrap()
+                .cumulative,
+            150,
+            "the watermark must be the larger cumulative, committed exactly once"
+        );
+    }
+
+    // Stochastic guard: race two concurrent vouchers (cumulative 100 and 150,
+    // priced at 100) from a zero watermark, many times, over a multi-thread
+    // runtime. Whatever the scheduling, at most one may be served, and any served
+    // voucher must have committed a delta of at least the price. This catches a
+    // regression that the deterministic seam's fixed ordering would miss.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_vouchers_serve_at_most_one_paid_request() {
+        for iter in 0..64u8 {
+            let owner = memory_signer(8);
+            let channel = Pubkey::new_unique();
+            let channel_b58 = pc::pubkey_string(&channel);
+
+            let store = Arc::new(MemoryChannelStore::new());
+            store
+                .put_channel(
+                    &channel_b58,
+                    seeded_state(&channel_b58, &pc::pubkey_string(&owner.pubkey()), 0),
+                )
+                .await
+                .unwrap();
+            // Independent handlers model separate replicas: their local gate
+            // maps are distinct, so only the shared store transaction can keep
+            // both vouchers from serving against the same committed delta.
+            let h1 = handler(store.clone());
+            let h2 = handler(store.clone());
+
+            let v100 = sign_voucher(&owner, &channel, 100, FAR_FUTURE)
+                .await
+                .unwrap();
+            let v150 = sign_voucher(&owner, &channel, 150, FAR_FUTURE)
+                .await
+                .unwrap();
+
+            let (c1, c2) = (channel_b58.clone(), channel_b58.clone());
+            let t1 = tokio::spawn(async move { h1.process_voucher(&c1, v100, 100).await });
+            let t2 = tokio::spawn(async move { h2.process_voucher(&c2, v150, 100).await });
+            let (r1, r2) = (t1.await.unwrap(), t2.await.unwrap());
+
+            // Count served requests; every served request must have committed at
+            // least the price. A served request reports its committed delta as
+            // `charged_amount`.
+            let mut served = 0;
+            for outcome in [r1, r2].into_iter().flatten() {
+                if outcome.serve {
+                    served += 1;
+                    let charged: u64 = outcome
+                        .response
+                        .charged_amount
+                        .as_deref()
+                        .unwrap_or("0")
+                        .parse()
+                        .unwrap();
+                    assert!(
+                        charged >= 100,
+                        "iter {iter}: a served voucher committed only {charged} (< price 100)"
+                    );
+                }
+            }
+            assert!(
+                served <= 1,
+                "iter {iter}: {served} requests served for a combined 150 committed (price 100)"
+            );
+        }
+    }
+
+    // ── Gate-map eviction: unauthenticated vouchers must not leak gate entries ─
+    //
+    // `process_voucher` acquires the per-channel gate before it can learn the
+    // channel does not exist. A client posting vouchers with random, nonexistent
+    // channel ids must not grow the gate map: each gate entry is refcounted and
+    // evicted once the request that created it drops its guard, so the map
+    // returns to empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn voucher_gate_map_evicts_entries_for_nonexistent_channels() {
+        let owner = memory_signer(41);
+        let store = Arc::new(MemoryChannelStore::new());
+        let h = handler(store);
+
+        // Post vouchers against many distinct channel ids that were never opened.
+        for _ in 0..32u32 {
+            let channel = Pubkey::new_unique();
+            let channel_b58 = pc::pubkey_string(&channel);
+            let voucher = sign_voucher(&owner, &channel, 100, FAR_FUTURE)
+                .await
+                .unwrap();
+            // The channel does not exist in the store, so `prev` reads 0 and the
+            // accept fails (or the serve is a no-op); either way the request
+            // returns and its gate guard is dropped.
+            let _ = h.process_voucher(&channel_b58, voucher, 100).await;
+        }
+
+        // Every gate entry must have been evicted once its request finished: the
+        // grow-only map (pre-fix) would hold 32 entries here.
+        let remaining = h
+            .voucher_gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        assert_eq!(
+            remaining, 0,
+            "gate entries for nonexistent channels must be evicted, found {remaining}"
+        );
+    }
+
+    // A contended gate entry is evicted once the last holder releases it: two
+    // vouchers race on one channel, and after both finish the map is empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn voucher_gate_map_evicts_contended_entry_after_last_release() {
+        let owner = memory_signer(42);
+        let channel = Pubkey::new_unique();
+        let channel_b58 = pc::pubkey_string(&channel);
+
+        let store = Arc::new(MemoryChannelStore::new());
+        store
+            .put_channel(
+                &channel_b58,
+                seeded_state(&channel_b58, &pc::pubkey_string(&owner.pubkey()), 0),
+            )
+            .await
+            .unwrap();
+        let h = handler(store);
+
+        let v100 = sign_voucher(&owner, &channel, 100, FAR_FUTURE)
+            .await
+            .unwrap();
+        let v150 = sign_voucher(&owner, &channel, 150, FAR_FUTURE)
+            .await
+            .unwrap();
+        let (h1, c1) = (h.clone(), channel_b58.clone());
+        let (h2, c2) = (h.clone(), channel_b58.clone());
+        let t1 = tokio::spawn(async move { h1.process_voucher(&c1, v100, 100).await });
+        let t2 = tokio::spawn(async move { h2.process_voucher(&c2, v150, 100).await });
+        let _ = t1.await.unwrap();
+        let _ = t2.await.unwrap();
+
+        let remaining = h
+            .voucher_gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        assert_eq!(
+            remaining, 0,
+            "a contended gate entry must be evicted once its last holder releases, found {remaining}"
+        );
+    }
+
+    // ── Header cap: an oversized PAYMENT-SIGNATURE header is rejected up front ─
+    //
+    // A batch-settlement header additionally embeds a full base64 transaction, so
+    // an unbounded header drives proportionally large base64 + JSON work. Cap it
+    // at 16 KiB before any decode, matching the `exact` / `upto` parsers.
+    #[test]
+    fn parse_payment_rejects_oversized_header() {
+        let h = handler(Arc::new(MemoryChannelStore::new()));
+        // 16 KiB + 1 byte: one over the cap.
+        let header = "A".repeat(16 * 1024 + 1);
+        assert_eq!(header.len(), 16 * 1024 + 1);
+        let err = h
+            .parse_payment(&header)
+            .expect_err("oversized header must be rejected");
+        assert!(
+            err.to_string().contains("exceeds maximum length"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_payment_accepts_at_max_header_size() {
+        // A header of exactly 16 KiB must pass the size gate. Its contents are
+        // not valid base64 JSON, so it still fails — but with a decode/parse
+        // error, NOT the size error. This pins the boundary at exactly the cap.
+        let h = handler(Arc::new(MemoryChannelStore::new()));
+        let at_max = "A".repeat(16 * 1024);
+        assert_eq!(at_max.len(), 16 * 1024);
+        let err = h
+            .parse_payment(&at_max)
+            .expect_err("invalid payload still errors");
+        assert!(
+            !err.to_string().contains("exceeds maximum length"),
+            "size gate must not fire at exactly the cap: {err}"
         );
     }
 

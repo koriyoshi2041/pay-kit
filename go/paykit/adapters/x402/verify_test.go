@@ -398,19 +398,21 @@ func TestVerifyAndSettleConfirmationError(t *testing.T) {
 	}
 }
 
-func TestVerifyAndSettleSendFailureRollsBackReplay(t *testing.T) {
+func TestVerifyAndSettleAmbiguousSendFailureKeepsReplay(t *testing.T) {
 	fake := &fakeRPC{sendErr: context.DeadlineExceeded}
 	a, gate, sig := settleFixture(t, fake)
 	if _, err := a.VerifyAndSettle(&paykit.AdapterRequest{Gate: gate, PaymentSig: sig}); err == nil {
 		t.Fatal("expected send_failed")
 	}
-	// Replay reservation must have been rolled back: a retry with a
-	// working RPC then succeeds rather than tripping signature_consumed.
+	// The node may have accepted the transaction before the timeout, so the
+	// reservation stays pinned and a retry cannot broadcast it again.
 	fake.sendErr = nil
 	fake.sig = solana.MustSignatureFromBase58(sampleSig)
 	fake.confirm = rpc.ConfirmationStatusConfirmed
-	if _, err := a.VerifyAndSettle(&paykit.AdapterRequest{Gate: gate, PaymentSig: sig}); err != nil {
-		t.Fatalf("retry after rollback should succeed, got %v", err)
+	_, err := a.VerifyAndSettle(&paykit.AdapterRequest{Gate: gate, PaymentSig: sig})
+	var perr *paykit.PaymentError
+	if !errorsAs(err, &perr) || perr.Code != "signature_consumed" {
+		t.Fatalf("retry after ambiguous send must be rejected, got %v", err)
 	}
 }
 

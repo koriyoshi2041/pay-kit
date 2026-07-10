@@ -40,7 +40,8 @@ import weakref
 
 from starlette.routing import Match
 
-from solana_pay_kit._middleware import PAYMENT_ATTR, PayCore, payment
+from solana_pay_kit._middleware import PAYMENT_ATTR, PayCore, X402ReplayStoreFactory, payment
+from solana_pay_kit._paycore.store import Store
 from solana_pay_kit.config import config as _config
 from solana_pay_kit.errors import InvalidProofError, PayKitError, PaymentRequiredError
 from solana_pay_kit.payment import Payment
@@ -122,6 +123,8 @@ class _PaywallRequirement:
     gate_ref: Gate | DynamicGate | Price | str | Callable[[Request], Gate] | None = None
     pricing: Pricing | None = None
     config: Config | None = None
+    x402_replay_store: Store | None = None
+    x402_replay_store_factory: X402ReplayStoreFactory | None = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +144,8 @@ class PaywallConfig:
     default_policy: PaywallDefaultPolicy = "public"
     paid_tags: tuple[str, ...] = ("paid", "pay")
     public_tags: tuple[str, ...] = ("public", "free")
+    x402_replay_store: Store | None = None
+    x402_replay_store_factory: X402ReplayStoreFactory | None = None
 
 
 def pay_required(
@@ -148,6 +153,8 @@ def pay_required(
     *,
     pricing: Pricing | None = None,
     config: Config | None = None,
+    x402_replay_store: Store | None = None,
+    x402_replay_store_factory: X402ReplayStoreFactory | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Mark a FastAPI endpoint as payment-required.
 
@@ -160,7 +167,13 @@ def pay_required(
         setattr(
             endpoint,
             _PAYWALL_REQUIRED_ATTR,
-            _PaywallRequirement(gate_ref=gate_ref, pricing=pricing, config=config),
+            _PaywallRequirement(
+                gate_ref=gate_ref,
+                pricing=pricing,
+                config=config,
+                x402_replay_store=x402_replay_store,
+                x402_replay_store_factory=x402_replay_store_factory,
+            ),
         )
         return endpoint
 
@@ -182,6 +195,8 @@ def RequirePayment(  # noqa: N802 - factory reads as a dependency constructor
     *,
     pricing: Pricing | None = None,
     config: Config | None = None,
+    x402_replay_store: Store | None = None,
+    x402_replay_store_factory: X402ReplayStoreFactory | None = None,
 ) -> Callable[..., Any]:
     """Build a FastAPI dependency that gates a route behind ``gate_ref``.
 
@@ -193,7 +208,11 @@ def RequirePayment(  # noqa: N802 - factory reads as a dependency constructor
     """
 
     async def dependency(request: Request) -> Payment:
-        core = PayCore.for_config(config if config is not None else _config())
+        core = PayCore.for_config(
+            config if config is not None else _config(),
+            x402_replay_store=x402_replay_store,
+            x402_replay_store_factory=x402_replay_store_factory,
+        )
         try:
             payment = await core.process(gate_ref, pricing, request)
         except PaymentRequiredError as exc:
@@ -355,7 +374,21 @@ def install_paywall_from_config(
             )
         pricing = requirement.pricing if requirement.pricing is not None else paywall.pricing
         config = requirement.config if requirement.config is not None else paywall.config
-        core = PayCore.for_config(config if config is not None else _config())
+        replay_store = (
+            requirement.x402_replay_store
+            if requirement.x402_replay_store is not None
+            else paywall.x402_replay_store
+        )
+        replay_store_factory = (
+            requirement.x402_replay_store_factory
+            if requirement.x402_replay_store_factory is not None
+            else paywall.x402_replay_store_factory
+        )
+        core = PayCore.for_config(
+            config if config is not None else _config(),
+            x402_replay_store=replay_store,
+            x402_replay_store_factory=replay_store_factory,
+        )
 
         try:
             verified = await core.process(gate_ref, pricing, request)
@@ -396,6 +429,8 @@ def install_paywall(
     paid_tags: tuple[str, ...] = ("paid", "pay"),
     public_tags: tuple[str, ...] = ("public", "free"),
     cors_origins: Sequence[str] | None = ("*",),
+    x402_replay_store: Store | None = None,
+    x402_replay_store_factory: X402ReplayStoreFactory | None = None,
 ) -> None:
     """Install a route-metadata paywall from app-level Pay settings.
 
@@ -416,6 +451,8 @@ def install_paywall(
             default_policy=default_policy,
             paid_tags=paid_tags,
             public_tags=public_tags,
+            x402_replay_store=x402_replay_store,
+            x402_replay_store_factory=x402_replay_store_factory,
         ),
         cors_origins=cors_origins,
     )

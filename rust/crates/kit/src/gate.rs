@@ -35,6 +35,7 @@ use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, MethodRouter};
 
+use crate::core::store::{ChannelStore, Store};
 use crate::mpp::server::{Config as MppConfig, Mpp};
 use crate::mpp::solana_keychain::SolanaSigner;
 use crate::mpp::{format_receipt, format_www_authenticate, Receipt, ReceiptKind};
@@ -93,6 +94,13 @@ pub struct PayKitConfig {
     pub accept_push_mode: bool,
     /// Currencies the server is willing to accept (x402 multi-currency).
     pub accepted_currencies: Option<Vec<String>>,
+    /// Atomic replay store for x402 exact settlement. Required outside
+    /// localnet unless `PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1` explicitly
+    /// acknowledges process-local replay protection.
+    pub x402_replay_store: Option<Arc<dyn Store>>,
+    /// Shared channel store for x402 batch settlement. Required outside
+    /// localnet whenever `fee_payer_signer` enables batch routes.
+    pub x402_channel_store: Option<Arc<dyn ChannelStore>>,
 }
 
 impl Default for PayKitConfig {
@@ -107,6 +115,8 @@ impl Default for PayKitConfig {
             fee_payer_signer: None,
             accept_push_mode: false,
             accepted_currencies: None,
+            x402_replay_store: None,
+            x402_channel_store: None,
         }
     }
 }
@@ -177,14 +187,18 @@ impl PayKit {
         })
         .map_err(|e| PayKitError::Mpp(e.to_string()))?;
 
-        let x402 = X402::new(X402Config {
+        let x402_config = X402Config {
             recipient: config.recipient.clone(),
             currencies: currencies.clone(),
             network: config.network.clone(),
             rpc_url: config.rpc_url.clone(),
             fee_payer_key,
             ..Default::default()
-        })
+        };
+        let x402 = match config.x402_replay_store.clone() {
+            Some(store) => X402::new_with_store(x402_config, store),
+            None => X402::new(x402_config),
+        }
         .map_err(|e| PayKitError::X402(e.to_string()))?;
 
         // The `upto` scheme needs an operator signer to settle vouchers, so it
@@ -226,9 +240,12 @@ impl PayKit {
                 batch.currency = config.currency.clone();
                 batch.decimals = config.decimals;
                 batch.rpc_url = config.rpc_url.clone();
-                X402BatchSettlement::new(batch)
-                    .map(Arc::new)
-                    .map_err(|e| PayKitError::X402(e.to_string()))
+                match config.x402_channel_store.clone() {
+                    Some(store) => X402BatchSettlement::with_store(batch, store),
+                    None => X402BatchSettlement::new(batch),
+                }
+                .map(Arc::new)
+                .map_err(|e| PayKitError::X402(e.to_string()))
             })
             .transpose()?;
 
@@ -480,7 +497,7 @@ struct GateState {
 }
 
 /// Build the 402 response carrying *both* protocol challenges.
-fn challenge_response(pay: &PayKit, amount: &str) -> Response {
+fn challenge_response(pay: &PayKit, amount: &str, resource: &str) -> Response {
     let mut resp = (StatusCode::PAYMENT_REQUIRED, "Payment Required").into_response();
     let headers = resp.headers_mut();
 
@@ -504,10 +521,14 @@ fn challenge_response(pay: &PayKit, amount: &str) -> Response {
     }
 
     // x402: PAYMENT-REQUIRED.
-    match pay
-        .x402
-        .payment_required_header(amount, ExactOptions::default())
-    {
+    match pay.x402.payment_required_header(
+        amount,
+        ExactOptions {
+            resource: Some(resource),
+            memo: Some(resource),
+            ..Default::default()
+        },
+    ) {
         Ok((name, value)) => match (
             HeaderName::from_bytes(name.as_bytes()),
             HeaderValue::from_str(&value),
@@ -571,6 +592,7 @@ async fn gate_middleware(State(state): State<GateState>, mut req: Request, next:
         };
         state.price.resolve(&ctx)
     };
+    let route_resource = req.uri().path().to_string();
 
     // Detect the protocol from disjoint headers.
     let mpp_credential = req
@@ -605,7 +627,7 @@ async fn gate_middleware(State(state): State<GateState>, mut req: Request, next:
                 attach_mpp_receipt(&mut resp, &receipt);
                 resp
             }
-            Err(_) => challenge_response(&state.pay, &amount),
+            Err(_) => challenge_response(&state.pay, &amount, &route_resource),
         };
     }
 
@@ -614,7 +636,15 @@ async fn gate_middleware(State(state): State<GateState>, mut req: Request, next:
         return match state
             .pay
             .x402
-            .process_payment(&header_value, &amount, ExactOptions::default())
+            .process_payment(
+                &header_value,
+                &amount,
+                ExactOptions {
+                    resource: Some(&route_resource),
+                    memo: Some(&route_resource),
+                    ..Default::default()
+                },
+            )
             .await
         {
             Ok(verified) => match x402_reference(&verified) {
@@ -633,15 +663,15 @@ async fn gate_middleware(State(state): State<GateState>, mut req: Request, next:
                         amount = %amount,
                         "x402 payment verified but carried no settlement reference"
                     );
-                    challenge_response(&state.pay, &amount)
+                    challenge_response(&state.pay, &amount, &route_resource)
                 }
             },
-            Err(_) => challenge_response(&state.pay, &amount),
+            Err(_) => challenge_response(&state.pay, &amount, &route_resource),
         };
     }
 
     // No credential of either protocol — advertise both challenges.
-    challenge_response(&state.pay, &amount)
+    challenge_response(&state.pay, &amount, &route_resource)
 }
 
 /// Gate a `GET` handler behind payment verification at `price`, accepting
@@ -984,6 +1014,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::store::{MemoryChannelStore, MemoryStore};
+    use crate::x402::protocol::schemes::exact::{
+        programs, resolve_stablecoin_mint, PaymentProof, PaymentSignatureEnvelope, EXACT_SCHEME,
+    };
+    use crate::x402::X402_VERSION_V2;
     use axum::body::Body;
     use axum::Router;
     use tower::ServiceExt; // oneshot
@@ -996,6 +1031,7 @@ mod tests {
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             network: "devnet".to_string(),
+            x402_replay_store: Some(Arc::new(MemoryStore::new())),
             ..Default::default()
         })
         .expect("valid paykit config")
@@ -1003,6 +1039,107 @@ mod tests {
 
     async fn report(_payment: Payment) -> &'static str {
         "ok"
+    }
+
+    fn paid_x402_header(pay: &PayKit, resource: &str, amount: &str) -> String {
+        use solana_hash::Hash;
+        use solana_instruction::{AccountMeta, Instruction};
+        use solana_message::Message;
+        use solana_pubkey::Pubkey;
+        use solana_signature::Signature;
+        use solana_transaction::versioned::VersionedTransaction;
+        use solana_transaction::Transaction;
+        use std::str::FromStr;
+
+        let options = ExactOptions {
+            resource: Some(resource),
+            memo: Some(resource),
+            ..Default::default()
+        };
+        let requirements = pay.x402().exact_requirements(amount, options).unwrap();
+        let mint = Pubkey::from_str(
+            resolve_stablecoin_mint(&requirements.currency, requirements.cluster.as_deref())
+                .unwrap_or(&requirements.currency),
+        )
+        .unwrap();
+        let recipient = Pubkey::from_str(&requirements.recipient).unwrap();
+        let token_program = Pubkey::from_str(
+            requirements
+                .token_program
+                .as_deref()
+                .unwrap_or(programs::TOKEN_PROGRAM),
+        )
+        .unwrap();
+        let ata_program = Pubkey::from_str(programs::ASSOCIATED_TOKEN_PROGRAM).unwrap();
+        let destination = Pubkey::find_program_address(
+            &[recipient.as_ref(), token_program.as_ref(), mint.as_ref()],
+            &ata_program,
+        )
+        .0;
+        let fee_payer = Pubkey::new_unique();
+        let owner = Pubkey::new_unique();
+        let source = Pubkey::find_program_address(
+            &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
+            &ata_program,
+        )
+        .0;
+        let mut transfer_data = vec![12];
+        transfer_data.extend_from_slice(&requirements.amount.parse::<u64>().unwrap().to_le_bytes());
+        transfer_data.push(requirements.decimals.unwrap());
+        let instructions = vec![
+            Instruction {
+                program_id: Pubkey::from_str(programs::COMPUTE_BUDGET_PROGRAM).unwrap(),
+                accounts: vec![],
+                data: [vec![2], 20_000u32.to_le_bytes().to_vec()].concat(),
+            },
+            Instruction {
+                program_id: Pubkey::from_str(programs::COMPUTE_BUDGET_PROGRAM).unwrap(),
+                accounts: vec![],
+                data: [vec![3], 1u64.to_le_bytes().to_vec()].concat(),
+            },
+            Instruction {
+                program_id: token_program,
+                accounts: vec![
+                    AccountMeta::new(source, false),
+                    AccountMeta::new_readonly(mint, false),
+                    AccountMeta::new(destination, false),
+                    AccountMeta::new_readonly(owner, true),
+                ],
+                data: transfer_data,
+            },
+            Instruction {
+                program_id: Pubkey::from_str(programs::MEMO_PROGRAM).unwrap(),
+                accounts: vec![],
+                data: resource.as_bytes().to_vec(),
+            },
+        ];
+        let mut tx =
+            VersionedTransaction::from(Transaction::new_unsigned(Message::new_with_blockhash(
+                &instructions,
+                Some(&fee_payer),
+                &Hash::new_from_array([9; 32]),
+            )));
+        for signature in &mut tx.signatures {
+            *signature = Signature::from([7; 64]);
+        }
+        let envelope = PaymentSignatureEnvelope {
+            scheme: Some(EXACT_SCHEME.to_string()),
+            network: Some(requirements.network.clone()),
+            x402_version: X402_VERSION_V2,
+            accepted: Some(serde_json::to_value(&requirements).unwrap()),
+            resource: None,
+            payload: PaymentProof::Transaction {
+                transaction: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    bincode::serialize(&tx).unwrap(),
+                ),
+            },
+            extensions: None,
+        };
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            serde_json::to_vec(&envelope).unwrap(),
+        )
     }
 
     fn test_signer() -> Arc<dyn SolanaSigner> {
@@ -1023,6 +1160,8 @@ mod tests {
             network: "devnet".to_string(),
             rpc_url: Some("http://127.0.0.1:1".to_string()),
             fee_payer_signer: Some(test_signer()),
+            x402_replay_store: Some(Arc::new(MemoryStore::new())),
+            x402_channel_store: Some(Arc::new(MemoryChannelStore::new())),
             ..Default::default()
         })
         .expect("valid paykit config")
@@ -1123,10 +1262,77 @@ mod tests {
         // Both protocol challenges are advertised.
         assert!(resp.headers().contains_key(header::WWW_AUTHENTICATE));
         assert!(resp.headers().contains_key("payment-required"));
+        let encoded = resp
+            .headers()
+            .get("payment-required")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let decoded =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded).unwrap();
+        let challenge: crate::x402::protocol::schemes::exact::PaymentRequiredEnvelope =
+            serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(
+            challenge
+                .resource
+                .as_ref()
+                .map(|resource| resource.url.as_str()),
+            Some("/r")
+        );
+        assert_eq!(
+            challenge.accepts[0]
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.get("memo"))
+                .and_then(|memo| memo.as_str()),
+            Some("/r")
+        );
         assert_eq!(
             resp.headers().get(header::CACHE_CONTROL).unwrap(),
             "no-store"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paid_x402_public_gate_uses_same_route_binding() {
+        let pay = test_paykit();
+        let header = paid_x402_header(&pay, "/r", "0.10");
+        let app: Router = Router::new().route("/r", paid_get(report, "0.10", &pay));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/r")
+                    .header(PAYMENT_SIGNATURE_HEADER, header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().contains_key(PAYMENT_RESPONSE_HEADER));
+    }
+
+    #[test]
+    fn nonlocal_paykit_requires_and_forwards_x402_replay_store() {
+        if std::env::var("PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE").as_deref() == Ok("1") {
+            return;
+        }
+        let missing = PayKit::new(PayKitConfig {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            network: "devnet".to_string(),
+            ..Default::default()
+        });
+        assert!(matches!(missing, Err(PayKitError::X402(_))));
+
+        let configured = PayKit::new(PayKitConfig {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            network: "devnet".to_string(),
+            x402_replay_store: Some(Arc::new(MemoryStore::new())),
+            ..Default::default()
+        });
+        assert!(configured.is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread")]

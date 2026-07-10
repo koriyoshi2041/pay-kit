@@ -30,8 +30,9 @@ from collections.abc import Callable, Coroutine
 from functools import wraps
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
-from solana_pay_kit._middleware import PAYMENT_ATTR, PayCore, is_paid
+from solana_pay_kit._middleware import PAYMENT_ATTR, PayCore, X402ReplayStoreFactory, is_paid
 from solana_pay_kit._middleware import payment as _core_payment
+from solana_pay_kit._paycore.store import Store
 from solana_pay_kit.config import config as _config
 from solana_pay_kit.errors import InvalidProofError, PayKitError, PaymentRequiredError
 from solana_pay_kit.payment import Payment
@@ -99,6 +100,8 @@ def require_payment(
     *,
     pricing: Pricing | None = None,
     config: Config | None = None,
+    x402_replay_store: Store | None = None,
+    x402_replay_store_factory: X402ReplayStoreFactory | None = None,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Decorate a Django view to require payment for ``gate_ref``.
 
@@ -113,7 +116,11 @@ def require_payment(
     def decorator(view: Callable[..., Any]) -> Callable[..., Any]:
         @wraps(view)
         def wrapper(request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
-            core = PayCore.for_config(config if config is not None else _config())
+            core = PayCore.for_config(
+                config if config is not None else _config(),
+                x402_replay_store=x402_replay_store,
+                x402_replay_store_factory=x402_replay_store_factory,
+            )
             try:
                 payment = _run(core.process(gate_ref, pricing, request))
             except PayKitError as exc:
@@ -201,9 +208,17 @@ class PaymentMiddleware:
     trio) is converted to the matching JSON response.
     """
 
-    def __init__(self, get_response: Callable[[HttpRequest], HttpResponse]) -> None:
+    def __init__(
+        self,
+        get_response: Callable[[HttpRequest], HttpResponse],
+        *,
+        x402_replay_store: Store | None = None,
+        x402_replay_store_factory: X402ReplayStoreFactory | None = None,
+    ) -> None:
         """Store the next handler in the Django middleware chain."""
         self._get_response = get_response
+        self._x402_replay_store = x402_replay_store
+        self._x402_replay_store_factory = x402_replay_store_factory
 
     def __call__(self, request: HttpRequest) -> HttpResponse:
         """Gate the request when it declares a gate, else pass it through."""
@@ -211,7 +226,11 @@ class PaymentMiddleware:
         if gate_ref is None:
             return self._passthrough(request)
 
-        core = PayCore.for_config(_config())
+        core = PayCore.for_config(
+            _config(),
+            x402_replay_store=self._x402_replay_store,
+            x402_replay_store_factory=self._x402_replay_store_factory,
+        )
         try:
             payment = _run(core.process(gate_ref, _request_pricing(request), request))
         except PayKitError as exc:
