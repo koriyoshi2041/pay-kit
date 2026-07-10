@@ -24,8 +24,9 @@ from solders.transaction import VersionedTransaction
 from solana_pay_kit import Gate, Price, Protocol, Stablecoin, configure
 from solana_pay_kit._paycore.mints import derive_ata, resolve, token_program_for
 from solana_pay_kit._paycore.solana import ASSOCIATED_TOKEN_PROGRAM
+from solana_pay_kit._paycore.store import MemoryStore
 from solana_pay_kit.config import reset
-from solana_pay_kit.errors import InvalidProofError
+from solana_pay_kit.errors import ConfigurationError, InvalidProofError
 from solana_pay_kit.protocols.x402 import ExactVerifier, X402Adapter
 from solana_pay_kit.protocols.x402.exact.verify import (
     COMPUTE_BUDGET_PROGRAM,
@@ -532,6 +533,18 @@ def test_adapter_accepts_entry_shape():
     assert entry["asset"] == MINT  # localnet falls back to mainnet mint (caveat #1)
     assert entry["extra"]["memo"] == "/report"
     assert "recentBlockhash" not in entry["extra"]  # no provider wired
+
+
+def test_adapter_rejects_explicit_process_local_store_outside_localnet(monkeypatch):
+    cfg = configure(network="solana_devnet", preflight=False)
+    store = MemoryStore()
+    monkeypatch.delenv("PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE", raising=False)
+
+    with pytest.raises(ConfigurationError, match="is_shared=False"):
+        X402Adapter(cfg, replay_store=store)
+
+    monkeypatch.setenv("PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE", "1")
+    assert X402Adapter(cfg, replay_store=store)._store is store
 
 
 def test_adapter_embeds_recent_blockhash_when_provider_set():
