@@ -188,7 +188,7 @@ export async function configure(params: ConfigureParams = {}): Promise<PayKitCon
         if (replayStore === undefined) {
             throw new ConfigurationError(
                 'MPP requires an injected atomic shared replayStore; ' +
-                    'mpp.allowUnsafeMemoryStore is development-only.',
+                    'mpp.allowUnsafeMemoryStore or PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1 is development-only.',
             );
         }
         if (!isAtomicReplayStore(replayStore)) {
