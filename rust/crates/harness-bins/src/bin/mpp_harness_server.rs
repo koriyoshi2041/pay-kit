@@ -380,6 +380,7 @@ fn read_state() -> Result<HarnessState, Box<dyn std::error::Error + Send + Sync>
             // exercised here, so leave it unset.
             recipient_signer: None,
             store,
+            allow_unsafe_memory_store: false,
             html: false,
             // Interop tests exercise push mode end-to-end; the gate is
             // opt-in (audit #5) so we set it explicitly here.
