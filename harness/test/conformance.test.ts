@@ -153,18 +153,15 @@ const UNSUPPORTED_MODE_EXEMPTIONS: Record<
   },
   "lua:charge:build-transaction": {
     owner: "harness",
-    date: "2026-07-09",
-    reason: "Lua is currently server-only in the conformance runner.",
-  },
-  "lua:charge:verify-transaction": {
-    owner: "harness",
-    date: "2026-07-09",
-    reason: "Lua verifies shared canonical bytes but has no charge transaction builder.",
+    date: "2026-07-10",
+    reason:
+      "Lua is currently server-only; its real charge verifier remains required.",
   },
   "lua:x402-exact:build-transaction": {
     owner: "harness",
-    date: "2026-07-09",
-    reason: "Lua's runner exercises the server-side exact verifier, not a client transaction builder.",
+    date: "2026-07-10",
+    reason:
+      "Lua is currently server-only; its real exact verifier remains required.",
   },
   "kotlin:charge:build-transaction": {
     owner: "harness",
