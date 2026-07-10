@@ -13,6 +13,7 @@ import {
     isReservingReplayStore,
 } from './replay-store.js';
 import { type KeychainSigner, type PayKitSigner, Signer } from './signer.js';
+import type { AtomicSubscriptionReplayStore } from './subscription-replay-store.js';
 
 /** MPP protocol options. */
 export type MppOptions = {
@@ -74,8 +75,12 @@ export type ConfigureParams = {
     readonly operator?: OperatorParams;
     /** Run boot-time safety checks. */
     readonly preflight?: boolean;
-    /** Replay-protection store. MPP validates atomic/shared capability at runtime. */
-    readonly replayStore?: Store.Store;
+    /**
+     * Replay-protection store. MPP validates atomic/shared capability at
+     * runtime; subscription gates additionally require the atomic
+     * {@link AtomicSubscriptionReplayStore} contract.
+     */
+    readonly replayStore?: AtomicSubscriptionReplayStore | Store.Store;
     /** Defaults to the public RPC endpoint for the network. */
     readonly rpcUrl?: string;
     /** Ordered settlement preference. */
@@ -97,7 +102,7 @@ export type PayKitConfig = {
     readonly network: Network;
     readonly operator: Operator;
     readonly preflight: boolean;
-    readonly replayStore: Store.Store | undefined;
+    readonly replayStore: AtomicSubscriptionReplayStore | Store.Store | undefined;
     readonly rpcUrl: string;
     readonly stablecoins: readonly Stablecoin[];
     readonly x402: Record<string, never>;
@@ -227,12 +232,18 @@ export async function configure(params: ConfigureParams = {}): Promise<PayKitCon
                     'mpp.allowUnsafeMemoryStore is development-only.',
             );
         }
-        if (!isAtomicReplayStore(replayStore)) {
+        if (!isAtomicReplayStore(replayStore) && !isReservingReplayStore(replayStore)) {
             throw new ConfigurationError(
-                'MPP replayStore must implement atomic putIfAbsent(key, value); legacy non-atomic stores fail closed.',
+                'MPP replayStore must implement atomic putIfAbsent(key, value) or reserve(key, value); ' +
+                    'legacy non-atomic stores fail closed.',
             );
         }
-        if (!allowUnsafeMemoryStore && !isProductionReplayStore(replayStore)) {
+        if (
+            !allowUnsafeMemoryStore &&
+            (!isAtomicReplayStore(replayStore) || !isProductionReplayStore(replayStore)) &&
+            (replayStore as AtomicSubscriptionReplayStore).isShared !== true &&
+            (replayStore as AtomicSubscriptionReplayStore).isDurable !== true
+        ) {
             throw new ConfigurationError(
                 'MPP replayStore must affirmatively set isShared=true or isDurable=true; unknown stores fail closed.',
             );

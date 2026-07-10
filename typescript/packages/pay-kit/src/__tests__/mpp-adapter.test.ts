@@ -6,6 +6,7 @@ import { Gate } from '../gate.js';
 import { usd } from '../price.js';
 import { Signer } from '../signer.js';
 import { createUnsafeMemoryReplayStore } from '../replay-store.js';
+import { createUnsafeMemorySubscriptionReplayStore } from '../subscription-replay-store.js';
 
 const SELLER = 'AyNAa2VPe2t5pgg8M61iE6kqMudkV98zsT4rkAZuU6tj';
 const PLATFORM = 'CXG3Pq3DwZb1HVckhPQbVxiwoNGM3jNGYvC2BSdkj1pK';
@@ -45,6 +46,18 @@ describe('createMppAdapter', () => {
         } finally {
             warn.mockRestore();
         }
+    });
+
+    it('rejects a process-local subscription replay store outside localnet', async () => {
+        await expect(
+            configure({
+                accept: ['mpp'],
+                mpp: { challengeBindingSecret: 'adapter-test-secret' },
+                network: 'solana_devnet',
+                operator: { feePayer: true, recipient: SELLER, signer: await Signer.generate() },
+                replayStore: createUnsafeMemorySubscriptionReplayStore(),
+            }),
+        ).rejects.toThrow(/isShared=true or isDurable=true/);
     });
 
     it('detects MPP payment credentials', async () => {
