@@ -23,6 +23,8 @@ import type {
 import { normalizeSignedVoucher, verifyVoucherSignature } from '../shared/voucher.js';
 import { createLifecycle, type Lifecycle } from './session/lifecycle.js';
 import {
+    type GetAccountInfoRpc,
+    isGetAccountInfoRpc,
     type MultiDelegateSubmitRpc,
     PAYMENT_CHANNELS_PROGRAM_ID,
     submitInitMultiDelegateTxIfMissing,
@@ -30,6 +32,7 @@ import {
     submitSettleAndDistribute,
     type SubmitSettleAndDistributeResult,
     type TopUpTransactionRpc,
+    verifyChannelAccountState,
     verifyOpenTx,
     verifyTopUpTransaction,
 } from './session/on-chain.js';
@@ -60,6 +63,24 @@ function resolveSessionStore(parameters: session.Parameters): SessionStore {
     const created = createMemorySessionStore();
     defaultStores.set(parameters, created);
     return created;
+}
+
+function sessionStoreSafetyMessage(store: SessionStore): string {
+    if (store.sessionStoreDurability === 'ephemeral') {
+        return 'ephemeral session store is unsafe off localnet; inject a durable shared SessionStore';
+    }
+    return 'session store must explicitly declare durable shared capability off localnet; inject a durable shared SessionStore';
+}
+
+function requireProductionSessionSafety(parameters: session.Parameters, store: SessionStore): void {
+    const network = parameters.network ?? 'mainnet';
+    if (
+        network !== 'localnet' &&
+        store.sessionStoreDurability !== 'durable-shared' &&
+        !parameters.allowUnsafeEphemeralStoreOffLocalnet
+    ) {
+        throw new Error(sessionStoreSafetyMessage(store));
+    }
 }
 
 /**
@@ -139,6 +160,7 @@ export function session(parameters: session.Parameters) {
 
     const rpcUrl = parameters.rpcUrl ?? DEFAULT_RPC_URLS[network] ?? DEFAULT_RPC_URLS['mainnet'];
     const store = resolveSessionStore(parameters);
+    requireProductionSessionSafety(parameters, store);
     const resolvedProgramId = (programId ?? PAYMENT_CHANNELS_PROGRAM_ID) as Address;
     const resolvedMint = resolveStablecoinMint(currency, network) ?? currency;
     const tokenProgram = parameters.tokenProgram ?? defaultTokenProgramForCurrency(currency, network);
@@ -302,9 +324,14 @@ export function session(parameters: session.Parameters) {
                         challengeId: cred.challenge.id,
                         externalId: cred.challenge.request.externalId,
                         lifecycle: lifecycleRef.value,
+                        mint: resolvedMint,
+                        network,
+                        operator,
                         payload: cred.payload,
                         programId: resolvedProgramId,
+                        recipient,
                         rpc,
+                        splits,
                         store,
                     });
                 case 'close':
@@ -356,6 +383,7 @@ session.routes = function routes(parameters: session.Parameters): session.Routes
     const cap = parameters.cap;
     if (cap === undefined) throw new Error('cap is required');
     const store = resolveSessionStore(parameters);
+    requireProductionSessionSafety(parameters, store);
     const currency = parameters.currency;
 
     return {
@@ -451,6 +479,8 @@ async function handleOpen(args: HandleOpenArgs): Promise<Receipt.Receipt> {
     // open transaction when present; otherwise from the client payload's
     // `recentSlot` echo.
     let openSlot: bigint | undefined = parseOptionalU64(payload.recentSlot, 'recentSlot');
+    let salt: bigint | undefined = parseOptionalU64(payload.salt, 'salt');
+    const paymentChannelBacked = payload.transaction !== undefined || mode === 'push';
 
     if (mode === 'push' && !payload.transaction && !payload.channelId) {
         throw new Error('open payload missing transaction or channelId');
@@ -485,11 +515,17 @@ async function handleOpen(args: HandleOpenArgs): Promise<Receipt.Receipt> {
             const preVerified = await verifyOpenTx({ expected, openPayload: payload });
             const existing = await args.store.getChannel(preVerified.channelId);
             if (existing) {
+                if (!existing.openSignature) {
+                    throw new Error(
+                        `server-submitted open ${preVerified.channelId} is missing its persisted broadcast signature`,
+                    );
+                }
                 channelId = preVerified.channelId;
                 deposit = preVerified.deposit;
                 channelPayer = preVerified.payer;
                 openSlot = preVerified.openSlot;
-                signature = payload.signature;
+                salt = preVerified.salt;
+                signature = existing.openSignature;
             } else {
                 const submitted = await submitOpenTx({
                     expected,
@@ -501,6 +537,7 @@ async function handleOpen(args: HandleOpenArgs): Promise<Receipt.Receipt> {
                 deposit = submitted.deposit;
                 channelPayer = submitted.payer;
                 openSlot = submitted.openSlot;
+                salt = submitted.salt;
                 signature = submitted.signature as unknown as string;
             }
         } else {
@@ -513,17 +550,12 @@ async function handleOpen(args: HandleOpenArgs): Promise<Receipt.Receipt> {
             deposit = verified.deposit;
             channelPayer = verified.payer;
             openSlot = verified.openSlot;
+            salt = verified.salt;
             signature = payload.signature;
         }
     } else if (mode === 'push') {
-        // No transaction in payload: the client asserts a previously
-        // broadcast open. When an RPC client is configured the open
-        // signature is confirmed on-chain before persisting (mirrors
-        // Rust `process_open`); without one the channelId/deposit
-        // fields are trusted as-is, matching Rust with `rpc_url`
-        // unset. The generated payment-channels client has no Channel
-        // account decoder yet, so the on-chain channel fields
-        // (payee/mint/authorizedSigner/deposit) are not re-checked.
+        // No transaction in payload: confirm the asserted signature, then bind
+        // the state below to the authoritative Channel account.
         channelId = expectString(payload.channelId, 'channelId');
         deposit = parseU64String(expectString(payload.deposit, 'deposit'), 'deposit');
         signature = payload.signature;
@@ -557,6 +589,46 @@ async function handleOpen(args: HandleOpenArgs): Promise<Receipt.Receipt> {
         }
     }
 
+    if (paymentChannelBacked) {
+        if (!args.rpc) {
+            if (args.network !== 'localnet') {
+                throw new Error(
+                    'payment-channel open requires an rpc client to bind the on-chain channel off localnet',
+                );
+            }
+        } else if (!isGetAccountInfoRpc(args.rpc)) {
+            if (args.network !== 'localnet') {
+                throw new Error(
+                    'open: configured rpc does not expose getAccountInfo — cannot bind the open to the on-chain Channel account',
+                );
+            }
+        } else {
+            const confirmedSlot = await assertSignatureSucceeded(
+                args.rpc as unknown as VerifyOpenRpc,
+                signature,
+                'open',
+            );
+            const channel = await verifyChannelAccountState({
+                channelId,
+                expected: {
+                    authorizedSigner: payload.authorizedSigner,
+                    mint: args.mint,
+                    payee: args.recipient,
+                    payer: payload.transaction ? channelPayer : undefined,
+                    programId: args.programId.toString(),
+                    rentPayer: args.operator,
+                    splits: args.splits,
+                },
+                minContextSlot: confirmedSlot,
+                rpc: args.rpc,
+            });
+            deposit = channel.deposit;
+            channelPayer = channel.payer;
+            openSlot = channel.openSlot;
+            salt = channel.salt;
+        }
+    }
+
     if (deposit === 0n) throw new Error('deposit must be greater than zero');
     if (deposit > args.cap) throw new Error(`deposit ${deposit} exceeds cap ${args.cap}`);
 
@@ -571,6 +643,8 @@ async function handleOpen(args: HandleOpenArgs): Promise<Receipt.Receipt> {
         highestVoucherSignature: undefined,
         nextDeliverySequence: 0n,
         openSlot,
+        salt,
+        ...(args.openTxSubmitter === 'server' ? { openSignature: signature } : {}),
         // Prefer the payer read from the verified open transaction (account 0,
         // what the channel actually records) over the client-supplied payload
         // fields, which could be stale/wrong. Fall back to the payload only for
@@ -708,6 +782,9 @@ interface HandleTopUpArgs {
     readonly challengeId: string | undefined;
     readonly externalId: string | undefined;
     readonly lifecycle: Lifecycle | undefined;
+    readonly mint: string;
+    readonly network: string;
+    readonly operator: string;
     readonly payload: {
         readonly action: 'topUp';
         readonly channelId: string;
@@ -715,7 +792,9 @@ interface HandleTopUpArgs {
         readonly signature: string;
     };
     readonly programId: Address;
+    readonly recipient: string;
     readonly rpc: RpcLike | undefined;
+    readonly splits: readonly SessionSplit[] | undefined;
     readonly store: SessionStore;
 }
 
@@ -733,20 +812,53 @@ async function handleTopUp(args: HandleTopUpArgs): Promise<Receipt.Receipt> {
         throw new Error('Channel close is pending — no further top-ups accepted');
     }
 
-    // Confirm the top-up transaction on-chain before raising the deposit
-    // (parity with the open-signature verification).
+    // Confirm the signature and bind the resulting account state before
+    // raising the local deposit.
     if (args.rpc) {
-        if (!isTopUpTransactionRpc(args.rpc)) {
+        const canBindTransaction = isTopUpTransactionRpc(args.rpc);
+        const canBindAccountState = isGetAccountInfoRpc(args.rpc);
+        if (!canBindTransaction && (!canBindAccountState || args.network !== 'localnet')) {
             throw new Error('topUp requires an rpc client with getTransaction to bind the deposit delta');
         }
-        await assertSignatureSucceeded(args.rpc as VerifyOpenRpc, args.payload.signature, 'topUp');
-        await verifyTopUpTransaction({
-            amount: newDeposit - existing.deposit,
-            channelId: args.payload.channelId,
-            programId: args.programId,
-            rpc: args.rpc,
-            signature: args.payload.signature as Signature,
-        });
+        const confirmedSlot = await assertSignatureSucceeded(
+            args.rpc as VerifyOpenRpc,
+            args.payload.signature,
+            'topUp',
+        );
+        if (canBindTransaction) {
+            await verifyTopUpTransaction({
+                amount: newDeposit - existing.deposit,
+                channelId: args.payload.channelId,
+                programId: args.programId.toString(),
+                rpc: args.rpc,
+                signature: args.payload.signature as Signature,
+            });
+        }
+        if (!canBindAccountState) {
+            if (args.network !== 'localnet') {
+                throw new Error(
+                    'topUp: configured rpc does not expose getAccountInfo — cannot bind the raised deposit to the on-chain Channel account',
+                );
+            }
+        } else {
+            await verifyChannelAccountState({
+                channelId: args.payload.channelId,
+                expected: {
+                    authorizedSigner: existing.authorizedSigner,
+                    deposit: newDeposit,
+                    mint: args.mint,
+                    payee: args.recipient,
+                    payer: existing.operator,
+                    programId: args.programId.toString(),
+                    rentPayer: args.operator,
+                    splits: args.splits,
+                },
+                minContextSlot: confirmedSlot,
+                rpc: args.rpc as GetAccountInfoRpc,
+            });
+        }
+    } else if (args.network !== 'localnet') {
+        throw new Error('payment-channel top-up requires an rpc client to bind the on-chain channel off localnet');
     }
 
     const result = await args.store.updateChannel(args.payload.channelId, current => {
@@ -1143,14 +1255,27 @@ function rejectIfVoucherRejected(result: VoucherVerifyResult): void {
 }
 
 /** Throw unless `signature` exists on-chain and executed without error. */
-async function assertSignatureSucceeded(rpc: VerifyOpenRpc, signature: string, context: string): Promise<void> {
-    const [status] = (await rpc.getSignatureStatuses([signature as Signature]).send()).value;
+async function assertSignatureSucceeded(
+    rpc: VerifyOpenRpc,
+    signature: string,
+    context: string,
+): Promise<bigint | number> {
+    const response = await rpc.getSignatureStatuses([signature as Signature]).send();
+    const [status] = response.value;
     if (!status) {
         throw new Error(`${context}: tx ${signature} not found on-chain`);
     }
     if (status.err) {
         throw new Error(`${context}: tx ${signature} failed on-chain: ${JSON.stringify(status.err)}`);
     }
+    if (status.confirmationStatus !== 'confirmed' && status.confirmationStatus !== 'finalized') {
+        throw new Error(`${context}: tx ${signature} is only ${String(status.confirmationStatus)}; confirmed required`);
+    }
+    return response.context?.slot ?? 0n;
+}
+
+function isTopUpTransactionRpc(rpc: RpcLike | undefined): rpc is RpcLike & TopUpTransactionRpc {
+    return typeof (rpc as { getTransaction?: unknown } | undefined)?.getTransaction === 'function';
 }
 
 /** Throw unless the voucher's Ed25519 signature verifies against `authorizedSigner`. */
@@ -1178,10 +1303,6 @@ function isMultiDelegateSubmitRpc(rpc: RpcLike | undefined): rpc is MultiDelegat
         typeof candidate.sendTransaction === 'function' &&
         typeof candidate.getSignatureStatuses === 'function'
     );
-}
-
-function isTopUpTransactionRpc(rpc: RpcLike | undefined): rpc is RpcLike & TopUpTransactionRpc {
-    return typeof (rpc as { getTransaction?: unknown } | undefined)?.getTransaction === 'function';
 }
 
 function isPlaceholderSignature(signature: string | undefined): boolean {
@@ -1229,7 +1350,10 @@ export type RpcLike = ReturnType<typeof createSolanaRpc> | SubmitOpenRpc;
 /** Minimal RPC subset used to verify open transactions. */
 export type VerifyOpenRpc = {
     getSignatureStatuses(signatures: readonly Signature[]): {
-        send(): Promise<{ value: ReadonlyArray<{ err: unknown } | null> }>;
+        send(): Promise<{
+            context?: { slot?: bigint | number };
+            value: ReadonlyArray<{ confirmationStatus?: string | null; err: unknown } | null>;
+        }>;
     };
 };
 
@@ -1284,6 +1408,8 @@ export declare namespace session {
     }
 
     interface Parameters {
+        /** Unsafe explicit dev escape hatch for process-local stores off localnet. */
+        readonly allowUnsafeEphemeralStoreOffLocalnet?: boolean;
         /** Maximum session cap the server will offer (base units). */
         readonly cap: bigint;
         /** Idle-close delay in ms. 0 (default) disables the watchdog. */

@@ -21,6 +21,7 @@ import (
 	"github.com/solana-foundation/pay-kit/go/paycore/paymentchannels"
 	"github.com/solana-foundation/pay-kit/go/paycore/solanatx"
 	"github.com/solana-foundation/pay-kit/go/protocols/mpp/intents"
+	pcgen "github.com/solana-foundation/pay-kit/go/protocols/programs/paymentchannels"
 )
 
 // openTxFixture bundles a freshly built and signed payment-channel open
@@ -616,6 +617,28 @@ func buildTopUpTx(t *testing.T, channel solana.PublicKey, currentDeposit, amount
 	}
 }
 
+func TestNewTopUpStateTxVerifierBindsConfirmedAccount(t *testing.T) {
+	config := sessionTestConfig()
+	fake := testutil.NewFakeRPC()
+	channelID := solana.NewWallet().PublicKey()
+	payer := solana.NewWallet().PublicKey()
+	authorizedSigner := solana.NewWallet().PublicKey()
+	seedSessionChannelAccount(
+		t, fake, channelID, 2_000_000, payer,
+		solana.MustPublicKeyFromBase58(config.Recipient), authorizedSigner,
+		solana.MustPublicKeyFromBase58(paycore.ResolveMint(config.Currency, config.Network)),
+		pcgen.ChannelStatus_Open,
+	)
+	signature := confirmedSignature(0x71)
+	verifier := NewTopUpStateTxVerifier(config, fake)
+	payload := &intents.TopUpPayload{ChannelID: channelID.String(), NewDeposit: "2000000", Signature: signature}
+	storedPayer := payer.String()
+	current := ChannelState{AuthorizedSigner: authorizedSigner.String(), Operator: &storedPayer}
+	if err := verifier(context.Background(), payload, current); err != nil {
+		t.Fatalf("verifier with confirmed signature: %v", err)
+	}
+}
+
 func TestNewTopUpTxVerifierBindsConfirmedTransaction(t *testing.T) {
 	channel := testutil.NewPrivateKey().PublicKey()
 	tx, payload := buildTopUpTx(t, channel, 1_000_000, 500_000)
@@ -850,6 +873,10 @@ func TestSettlementInstructionsResolvesToken2022FromCurrency(t *testing.T) {
 	config := sessionTestConfig()
 	config.Currency = "PYUSD"
 	config.Network = "mainnet"
+	config.AllowUnsafeEphemeralStoreOffLocalnet = true
+	config.VerifyOpenTx = func(_ context.Context, payload *intents.OpenPayload) (string, error) {
+		return *payload.Payer, nil
+	}
 	server := newSessionTestServer(config)
 	payer := testutil.NewPrivateKey().PublicKey()
 	merchant := testutil.NewPrivateKey().PublicKey()

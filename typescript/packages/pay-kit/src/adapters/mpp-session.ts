@@ -8,7 +8,8 @@
  *
  * pay-kit does NOT auto-mount the side-channel routes (mppx-consistent): the
  * instance exposes `handler` / `deliveries` / `commit` / `receipt` and the app
- * mounts them. All four share the configured session store per gate.
+ * mounts them. All four share the injected session store (or an explicitly
+ * localnet-only in-memory store) per gate.
  */
 import { createSolanaRpc } from '@solana/kit';
 import { resolveStablecoinMint } from '@solana/mpp';
@@ -19,6 +20,10 @@ import type { PayKitConfig } from '../config.js';
 import { ConfigurationError } from '../errors.js';
 import type { Gate } from '../gate.js';
 import { toSolanaNetwork } from '../protocol.js';
+
+type SessionStoreCapability = {
+    readonly sessionStoreDurability?: 'durable-shared' | 'ephemeral';
+};
 
 /** Outcome of running the session method on the gated route. */
 export type SessionResult =
@@ -66,6 +71,14 @@ export function createSessionEngine(config: PayKitConfig, gate: Gate): SessionEn
 
     const signer = config.operator.signer.signer;
     const store = resolveSessionStore(config);
+    if (
+        config.network !== 'solana_localnet' &&
+        (store as SessionStoreCapability & typeof store).sessionStoreDurability !== 'durable-shared'
+    ) {
+        throw new ConfigurationError(
+            `Gate "${gate.name}": session store must explicitly declare durable shared capability outside localnet.`,
+        );
+    }
     const params = {
         cap: gate.amount.baseUnits(),
         ...(gate.session.closeDelayMs !== undefined ? { closeDelayMs: gate.session.closeDelayMs } : {}),

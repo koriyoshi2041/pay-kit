@@ -26,6 +26,7 @@ import (
 	solana "github.com/solana-foundation/solana-go/v2"
 	"github.com/solana-foundation/solana-go/v2/rpc"
 
+	"github.com/solana-foundation/pay-kit/go/paycore"
 	"github.com/solana-foundation/pay-kit/go/paycore/solanatx"
 	core "github.com/solana-foundation/pay-kit/go/protocols/mpp/core"
 	"github.com/solana-foundation/pay-kit/go/protocols/mpp/intents"
@@ -113,6 +114,10 @@ type SessionOptions struct {
 	// PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1 explicitly opts into development
 	// replay protection. Localnet defaults to MemoryChannelStore.
 	Store ChannelStore
+
+	// AllowUnsafeEphemeralStoreOffLocalnet permits the built-in process-local
+	// memory store outside localnet. Unsafe; intended only for explicit dev use.
+	AllowUnsafeEphemeralStoreOffLocalnet bool
 
 	// RPC is the optional RPC client used for on-chain checks, the
 	// recentBlockhash prefetch, and settlement broadcasts. Nil skips every
@@ -229,12 +234,13 @@ func NewSession(options SessionOptions) (*Session, error) {
 			"pullVoucherStrategy is required when modes includes pull")
 	}
 	store := options.Store
+	allowUnsafeEphemeral := options.AllowUnsafeEphemeralStoreOffLocalnet || os.Getenv(allowInMemoryReplayStoreEnvVar) == "1"
 	usesMemoryChannelStore := false
 	if store != nil {
 		_, usesMemoryChannelStore = store.(*MemoryChannelStore)
 	}
-	if options.Network != "localnet" && (store == nil || usesMemoryChannelStore) && os.Getenv(allowInMemoryReplayStoreEnvVar) != "1" {
-		storeDescription := "no session store"
+	if options.Network != "localnet" && (store == nil || usesMemoryChannelStore) && !allowUnsafeEphemeral {
+		storeDescription := "session store is required (no session store)"
 		if usesMemoryChannelStore {
 			storeDescription = "process-local *MemoryChannelStore"
 		}
@@ -248,21 +254,32 @@ func NewSession(options SessionOptions) (*Session, error) {
 	if options.Logger == nil {
 		options.Logger = slog.Default()
 	}
+	if options.Network != "localnet" && !allowUnsafeEphemeral && !isDurableSharedSessionStore(store) {
+		return nil, core.NewError(core.ErrCodeInvalidConfig,
+			sessionStoreSafetyMessage(store))
+	}
 
 	config := SessionConfig{
-		Operator:            options.Operator,
-		Recipient:           options.Recipient,
-		Splits:              options.Splits,
-		MaxCap:              options.Cap,
-		Currency:            options.Currency,
-		Decimals:            options.Decimals,
-		Network:             options.Network,
-		ProgramID:           options.ProgramID,
-		MinVoucherDelta:     options.MinVoucherDelta,
-		Modes:               options.Modes,
-		PullVoucherStrategy: options.PullVoucherStrategy,
+		Operator:                             options.Operator,
+		Recipient:                            options.Recipient,
+		Splits:                               options.Splits,
+		MaxCap:                               options.Cap,
+		Currency:                             options.Currency,
+		Decimals:                             options.Decimals,
+		Network:                              options.Network,
+		ProgramID:                            options.ProgramID,
+		MinVoucherDelta:                      options.MinVoucherDelta,
+		Modes:                                options.Modes,
+		PullVoucherStrategy:                  options.PullVoucherStrategy,
+		AllowUnsafeEphemeralStoreOffLocalnet: allowUnsafeEphemeral,
 	}
-	config.VerifyTopUpTx = NewTopUpTxVerifier(config, options.RPC)
+	if verifier := NewTopUpTxVerifier(config, options.RPC); verifier != nil {
+		config.VerifyTopUpTx = verifier
+	}
+	if options.RPC != nil {
+		config.VerifyOpenTx = NewOpenTxVerifier(config, options.RPC)
+	}
+	config.VerifyTopUpStateTx = NewTopUpStateTxVerifier(config, options.RPC)
 	session := &Session{
 		core:            NewSessionServer(config, store),
 		secretKey:       options.SecretKey,
@@ -531,6 +548,8 @@ func (s *Session) handleOpen(ctx context.Context, payload *intents.OpenPayload) 
 	// Channel open_slot (a PDA seed), read from the verified open transaction
 	// when one is present, else from the payload's recentSlot echo.
 	openSlot := openSlotFromPayload(payload)
+	var salt uint64
+	var openSignature string
 
 	switch {
 	case hasTransaction:
@@ -562,10 +581,16 @@ func (s *Session) handleOpen(ctx context.Context, payload *intents.OpenPayload) 
 				return "", err
 			}
 			if existing != nil {
+				if existing.OpenSignature == "" {
+					return "", fmt.Errorf("server-submitted open %s is missing its persisted broadcast signature", preVerified.ChannelID)
+				}
 				channelID = preVerified.ChannelID
 				deposit = preVerified.Deposit
 				channelPayer = preVerified.Payer
 				openSlot = preVerified.OpenSlot
+				salt = preVerified.Salt
+				signature = existing.OpenSignature
+				openSignature = existing.OpenSignature
 			} else {
 				submitted, err := SubmitOpenTx(ctx, expected, payload, s.payerSigner, s.rpc)
 				if err != nil {
@@ -575,7 +600,9 @@ func (s *Session) handleOpen(ctx context.Context, payload *intents.OpenPayload) 
 				deposit = submitted.Deposit
 				channelPayer = submitted.Payer
 				openSlot = submitted.OpenSlot
+				salt = submitted.Salt
 				signature = submitted.Signature
+				openSignature = submitted.Signature
 			}
 		} else {
 			verified, err := VerifyOpenTx(ctx, expected, payload, s.rpc)
@@ -586,6 +613,42 @@ func (s *Session) handleOpen(ctx context.Context, payload *intents.OpenPayload) 
 			deposit = verified.Deposit
 			channelPayer = verified.Payer
 			openSlot = verified.OpenSlot
+			salt = verified.Salt
+		}
+		if s.rpc == nil {
+			if s.network != "localnet" {
+				return "", fmt.Errorf("payment-channel open requires an rpc client to bind the on-chain channel off localnet")
+			}
+		} else {
+			confirmedSlot, err := confirmedTransactionSlot(ctx, s.rpc, signature, "open")
+			if err != nil {
+				return "", err
+			}
+			channelPDA, err := solana.PublicKeyFromBase58(channelID)
+			if err != nil {
+				return "", fmt.Errorf("invalid channelId %q: %w", channelID, err)
+			}
+			bound, err := fetchAndBindChannelAccount(
+				ctx,
+				s.rpc,
+				channelPDA,
+				paycore.ResolveMint(s.currency, s.network),
+				s.recipient,
+				s.core.config.Operator,
+				payload.AuthorizedSigner,
+				expectedSessionGracePeriod(s.core.config),
+				sessionDistributionHash(s.core.config.Splits),
+				true,
+				s.core.config.ProgramID,
+				confirmedSlot,
+			)
+			if err != nil {
+				return "", err
+			}
+			deposit = bound.Deposit
+			channelPayer = bound.Payer
+			openSlot = bound.OpenSlot
+			salt = bound.Salt
 		}
 	case mode == intents.SessionModePush:
 		// No transaction in the payload: the client asserts a previously
@@ -599,9 +662,37 @@ func (s *Session) handleOpen(ctx context.Context, payload *intents.OpenPayload) 
 			return "", err
 		}
 		if s.rpc != nil {
-			if err := confirmTransactionSignature(ctx, s.rpc, signature, "open"); err != nil {
+			confirmedSlot, err := confirmedTransactionSlot(ctx, s.rpc, signature, "open")
+			if err != nil {
 				return "", err
 			}
+			channelPDA, err := solana.PublicKeyFromBase58(channelID)
+			if err != nil {
+				return "", fmt.Errorf("invalid channelId %q: %w", channelID, err)
+			}
+			bound, err := fetchAndBindChannelAccount(
+				ctx,
+				s.rpc,
+				channelPDA,
+				paycore.ResolveMint(s.currency, s.network),
+				s.recipient,
+				s.core.config.Operator,
+				payload.AuthorizedSigner,
+				expectedSessionGracePeriod(s.core.config),
+				sessionDistributionHash(s.core.config.Splits),
+				true,
+				s.core.config.ProgramID,
+				confirmedSlot,
+			)
+			if err != nil {
+				return "", err
+			}
+			deposit = bound.Deposit
+			channelPayer = bound.Payer
+			openSlot = bound.OpenSlot
+			salt = bound.Salt
+		} else if s.network != "localnet" {
+			return "", fmt.Errorf("payment-channel push open requires an rpc client to bind the on-chain channel off localnet")
 		}
 	default:
 		// Pull mode without a channel transaction: trust the
@@ -638,6 +729,8 @@ func (s *Session) handleOpen(ctx context.Context, payload *intents.OpenPayload) 
 		AuthorizedSigner: payload.AuthorizedSigner,
 		Deposit:          deposit,
 		OpenSlot:         openSlot,
+		Salt:             salt,
+		OpenSignature:    openSignature,
 		Operator:         operator,
 	}
 
@@ -703,6 +796,20 @@ func (s *Session) handleTopUp(ctx context.Context, payload *intents.TopUpPayload
 		return "", fmt.Errorf("newDeposit %d exceeds cap %d", newDeposit, s.cap)
 	}
 
+	// Cheap store pre-checks before touching the network.
+	existing, err := s.core.store.GetChannel(ctx, payload.ChannelID)
+	if err != nil {
+		return "", err
+	}
+	if existing == nil {
+		return "", fmt.Errorf("channel %s not found", payload.ChannelID)
+	}
+	if existing.Sealed {
+		return "", fmt.Errorf("channel %s is already sealed", payload.ChannelID)
+	}
+	if existing.CloseRequestedAt != nil {
+		return "", fmt.Errorf("channel %s close is pending; no further top-ups accepted", payload.ChannelID)
+	}
 	if _, err := s.core.ProcessTopUp(ctx, payload); err != nil {
 		return "", err
 	}

@@ -12,9 +12,8 @@ the idle-close watchdog.
 Trust model / on-chain seam: the RPC client is optional. With no RPC client the
 transaction signature and deposit amount are trusted as provided (offline
 core); with an RPC client an open's confirmation signature is checked on-chain
-before the channel is persisted, and a top-up's confirmed instruction is bound
-to its exact channel and deposit delta before the deposit is raised. The
-on-chain check is wired through the
+before the channel is persisted, and a top-up signature is confirmed before the
+deposit is raised. The on-chain check is wired through the
 :class:`SessionServer` config seams
 (:func:`~solana_pay_kit.protocols.mpp.server.session_onchain.new_open_tx_verifier` /
 :func:`~solana_pay_kit.protocols.mpp.server.session_onchain.new_top_up_tx_verifier`).
@@ -34,7 +33,6 @@ dispatch.
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -47,7 +45,7 @@ from solana_pay_kit._paycore.errors import (
     PaymentError,
     payment_required_response,
 )
-from solana_pay_kit._paycore.solana import MAX_SPLITS
+from solana_pay_kit._paycore.solana import MAX_SPLITS, resolve_mint
 from solana_pay_kit.protocols.mpp.core.expires import minutes
 from solana_pay_kit.protocols.mpp.core.headers import (
     PAYMENT_RECEIPT_HEADER,
@@ -74,17 +72,23 @@ from solana_pay_kit.protocols.mpp.server.session_onchain import (
     VerifyOpenTxExpected,
     confirm_transaction_signature,
     cosign_and_broadcast_open,
-    new_top_up_tx_verifier,
+    fetch_and_bind_channel_account,
     settle_and_seal_channel,
     verify_open_tx,
 )
-from solana_pay_kit.protocols.mpp.server.session_store import ChannelStore, MemoryChannelStore
+from solana_pay_kit.protocols.mpp.server.session_store import (
+    ChannelStore,
+    MemoryChannelStore,
+    SessionStoreDurability,
+)
+from solana_pay_kit.protocols.mpp.server.session_store import (
+    session_store_safety_message as _session_store_safety_message,
+)
 from solana_pay_kit.signer import LocalSigner
 
 logger = logging.getLogger(__name__)
 
 _SECRET_KEY_ENV_VAR = "MPP_SECRET_KEY"
-_ALLOW_INMEMORY_REPLAY_STORE_ENV = "PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE"
 _U64_MAX = (1 << 64) - 1
 
 
@@ -164,10 +168,11 @@ class SessionOptions:
     # OpenTxSubmitter selects who broadcasts push-mode open transactions.
     # Default "client".
     open_tx_submitter: OpenTxSubmitter = ""
-    # Store is the pluggable channel store. Localnet defaults to in-memory;
-    # off-localnet requires a durable store unless the development escape hatch
-    # PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1 is set explicitly.
+    # Store is required off localnet so production session state cannot become
+    # silently process-local. Localnet defaults to in-memory for development.
     store: ChannelStore | None = None
+    # Unsafe explicit development escape hatch for stores not marked durable/shared.
+    allow_unsafe_ephemeral_store_off_localnet: bool = False
     # RPC is the optional RPC client used for on-chain checks. None skips every
     # on-chain check and trusts payload claims as provided.
     rpc: RpcClient | None = None
@@ -566,7 +571,6 @@ class Session:
             operator=self._core.config.operator,
             program_id=(Pubkey.from_string(self._core.config.program_id) if self._core.config.program_id else None),
             recent_slot=challenge_recent_slot,
-            recipients=[(split.recipient, split.bps) for split in self._core.config.splits],
         )
 
     async def _handle_open(self, payload: OpenPayload, challenge_recent_slot: int | None = None) -> str:
@@ -640,6 +644,14 @@ class Session:
                         f"channel {session_id} already exists with a different authorized signer",
                         code="invalid-payload",
                     )
+                if existing.open_signature is None:
+                    raise PaymentError(
+                        f"server-submitted open {session_id} is missing its persisted broadcast signature",
+                        code="invalid-payload",
+                    )
+                payload.signature = existing.open_signature
+                payload.salt = existing.salt
+                payload.recent_slot = existing.open_slot
             else:
                 # Built lazily: only the transaction-carrying paths verify
                 # the open on-chain, so the on-chain expected facts (and the
@@ -654,6 +666,7 @@ class Session:
                     # openSlot from the verified transaction is authoritative;
                     # persist it so the channel PDA stays re-derivable.
                     payload.recent_slot = verified.open_slot
+                    payload.salt = verified.salt
                     payload.signature = await cosign_and_broadcast_open(
                         payload, fee_payer=self._signer.keypair, rpc=self._rpc
                     )
@@ -678,18 +691,80 @@ class Session:
                 payload.payer = verified.payer
             payload.deposit = str(verified.deposit)
             payload.recent_slot = verified.open_slot
+            payload.salt = verified.salt
         elif mode == "push" and self._signer is not None and self._rpc is not None and not payload.payer:
             raise PaymentError(
                 "push open requires payer or transaction when settle-at-close is configured",
                 code="invalid-payload",
             )
         elif mode == "push" and self._rpc is not None:
-            await confirm_transaction_signature(self._rpc, payload.signature, "open")
+            confirmed_slot = await confirm_transaction_signature(self._rpc, payload.signature, "open")
+            expected_mint = resolve_mint(self._currency, self._network)
+            if not expected_mint:
+                raise PaymentError(
+                    f"payment-channel push open requires an SPL token, got currency {self._currency!r}",
+                    code="invalid-config",
+                )
+            bound = await fetch_and_bind_channel_account(
+                self._rpc,
+                payload.session_id(),
+                program_id=self._core.config.program_id,
+                max_cap=self._core.config.max_cap,
+                expected_authorized_signer=payload.authorized_signer,
+                expected_payee=self._recipient,
+                expected_mint=expected_mint,
+                expected_operator=self._core.config.operator,
+                min_context_slot=confirmed_slot,
+                expected_grace_period=(self._core.config.settlement_window or 900),
+                expected_splits=self._core.config.splits,
+            )
+            payload.deposit = str(bound.deposit)
+            payload.payer = bound.payer
+            payload.recent_slot = bound.open_slot
+            payload.salt = bound.salt
+        elif mode == "push" and self._network != "localnet":
+            raise PaymentError(
+                "payment-channel push open requires an rpc client to bind the on-chain channel off localnet",
+                code="invalid-config",
+            )
         # else: no transaction is attached. Reachable by a pull open (the channel
         # id / token account and deposit are trusted as provided, mirroring the TS
         # `else` branch) or by a push open with a channel id and no RPC (trusted
         # as previously broadcast). The server-broadcast path is skipped even when
         # openTxSubmitter=server is configured.
+
+        if has_transaction:
+            if self._rpc is None:
+                if self._network != "localnet":
+                    raise PaymentError(
+                        "payment-channel open requires an rpc client to bind the on-chain channel off localnet",
+                        code="invalid-config",
+                    )
+            else:
+                confirmed_slot = await confirm_transaction_signature(self._rpc, payload.signature, "open")
+                expected_mint = resolve_mint(self._currency, self._network)
+                if not expected_mint:
+                    raise PaymentError(
+                        f"payment-channel open requires an SPL token, got currency {self._currency!r}",
+                        code="invalid-config",
+                    )
+                bound = await fetch_and_bind_channel_account(
+                    self._rpc,
+                    payload.session_id(),
+                    program_id=self._core.config.program_id,
+                    max_cap=self._core.config.max_cap,
+                    expected_authorized_signer=payload.authorized_signer,
+                    expected_payee=self._recipient,
+                    expected_mint=expected_mint,
+                    expected_operator=self._core.config.operator,
+                    min_context_slot=confirmed_slot,
+                    expected_grace_period=(self._core.config.settlement_window or 900),
+                    expected_splits=self._core.config.splits,
+                )
+                payload.deposit = str(bound.deposit)
+                payload.payer = bound.payer
+                payload.recent_slot = bound.open_slot
+                payload.salt = bound.salt
 
         try:
             state = await self._core.process_open(payload)
@@ -722,8 +797,9 @@ class Session:
         return f"{receipt.session_id}:{receipt.delivery_id}:{receipt.cumulative}"
 
     async def _handle_top_up(self, payload: TopUpPayload) -> str:
-        """Raise a channel's deposit after optional confirmed-transaction
-        value binding. The receipt reference is the top-up transaction signature."""
+        """Raise a channel's deposit after optional on-chain confirmation of the
+        top-up signature. The receipt reference is the top-up transaction
+        signature."""
         try:
             new_deposit = _parse_session_u64(payload.new_deposit, "newDeposit")
         except ValueError as exc:
@@ -744,6 +820,8 @@ class Session:
             )
         try:
             await self._core.process_top_up(payload)
+        except PaymentError:
+            raise
         except ValueError as exc:
             raise PaymentError(str(exc), code="invalid-payload") from exc
         self._touch(payload.channel_id)
@@ -955,6 +1033,8 @@ def new_session(options: SessionOptions) -> Session:
 
     secret_key = options.secret_key
     if secret_key == "":
+        import os
+
         secret_key = os.environ.get(_SECRET_KEY_ENV_VAR, "")
     if secret_key == "":
         raise PaymentError("missing secret key", code="invalid-config")
@@ -981,17 +1061,21 @@ def new_session(options: SessionOptions) -> Session:
             code="invalid-config",
         )
 
-    uses_memory_store = options.store is None or isinstance(options.store, MemoryChannelStore)
-    is_localnet = network in ("localnet", "solana_localnet")
-    if uses_memory_store and not is_localnet and os.getenv(_ALLOW_INMEMORY_REPLAY_STORE_ENV) != "1":
+    if options.store is None and network != "localnet":
         raise PaymentError(
-            "a durable channel store is required outside localnet; set "
-            f"{_ALLOW_INMEMORY_REPLAY_STORE_ENV}=1 to explicitly allow a process-local "
-            "MemoryChannelStore for development",
+            "session store is required off localnet; inject a durable shared ChannelStore",
             code="invalid-config",
         )
-
     store = options.store if options.store is not None else MemoryChannelStore()
+    if (
+        network != "localnet"
+        and not options.allow_unsafe_ephemeral_store_off_localnet
+        and store.session_store_durability != SessionStoreDurability.DURABLE_SHARED
+    ):
+        raise PaymentError(
+            _session_store_safety_message(store),
+            code="invalid-config",
+        )
 
     config = SessionConfig(
         operator=options.operator,
@@ -1006,11 +1090,15 @@ def new_session(options: SessionOptions) -> Session:
         modes=options.modes,
         pull_voucher_strategy=options.pull_voucher_strategy,
     )
-    # Open verification remains in the method layer because server-broadcast
-    # opens need request-specific signing. Top-ups use the core seam so it can
-    # bind the confirmed transaction's delta to the exact channel snapshot and
-    # recheck that snapshot atomically after the RPC await.
-    config.verify_top_up_tx = new_top_up_tx_verifier(config, options.rpc)
+    from solana_pay_kit.protocols.mpp.server.session_onchain import (
+        new_open_tx_verifier,
+        new_top_up_state_tx_verifier,
+    )
+
+    config.allow_unsafe_ephemeral_store_off_localnet = options.allow_unsafe_ephemeral_store_off_localnet
+    if options.rpc is not None:
+        config.verify_open_tx = new_open_tx_verifier(config, options.rpc)
+    config.verify_top_up_state_tx = new_top_up_state_tx_verifier(config, options.rpc)
     core = SessionServer(config, store)
     session = Session(
         core=core,

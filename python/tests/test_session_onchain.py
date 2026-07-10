@@ -12,7 +12,10 @@ verifier-through-``ProcessOpen`` paths land with that follow-up.
 from __future__ import annotations
 
 import base64
+import hashlib
+import struct
 from dataclasses import dataclass, field, replace
+from typing import Any
 
 import pytest
 from solders.hash import Hash  # type: ignore[import-untyped]
@@ -30,19 +33,16 @@ from solana_pay_kit._paycore.errors import PaymentError
 from solana_pay_kit._paycore.solana import TOKEN_PROGRAM
 from solana_pay_kit.protocols.mpp._paymentchannels import (
     PROGRAM_ID,
-    Distribution,
     OpenChannelParams,
-    TopUpParams,
     build_open_instruction,
-    build_top_up_instruction,
     find_channel_pda,
 )
 from solana_pay_kit.protocols.mpp.intents.session import OpenPayload, TopUpPayload
-from solana_pay_kit.protocols.mpp.server.session import Split
 from solana_pay_kit.protocols.mpp.server.session_onchain import (
     VerifyOpenTxExpected,
     is_placeholder_signature,
     new_open_tx_verifier,
+    new_top_up_state_tx_verifier,
     new_top_up_tx_verifier,
     verify_open_tx,
 )
@@ -78,7 +78,12 @@ class _FakeRpc:
 
     def __init__(self) -> None:
         self.statuses: dict[str, dict | None] = {}
-        self.transactions: dict[str, dict] = {}
+        self.accounts: dict[str, tuple[bytes, str] | None] = {}
+
+    async def get_account_info(
+        self, address: str, commitment: str = "confirmed", min_context_slot: int | None = None
+    ) -> tuple[bytes, str] | None:
+        return self.accounts.get(address)
 
     async def get_signature_statuses(self, signatures: list[str]) -> list[dict | None]:
         out: list[dict | None] = []
@@ -86,7 +91,7 @@ class _FakeRpc:
             if signature in self.statuses:
                 out.append(self.statuses[signature])
             else:
-                out.append({"err": None, "confirmationStatus": "confirmed"})
+                out.append({"err": None, "confirmationStatus": "confirmed", "slot": 42})
         return out
 
     async def get_latest_blockhash(self, commitment: str = "confirmed"):  # noqa: ANN201 (RPC seam stub)
@@ -95,12 +100,35 @@ class _FakeRpc:
     async def send_raw_transaction(self, raw_tx: bytes):  # noqa: ANN201 (RPC seam stub)
         raise NotImplementedError  # not exercised by the open/top-up verifier tests
 
-    async def get_transaction(self, signature: str, **_kwargs):  # noqa: ANN201 (RPC seam stub)
-        return self.transactions.get(str(signature))
-
 
 def _kp(seed: int) -> Keypair:
     return Keypair.from_seed(bytes([seed] * 32))
+
+
+def _channel_account(fixture: OpenTxFixture, deposit: int) -> tuple[bytes, str]:
+    from solana_pay_kit.protocols.programs.paymentchannels.accounts.channel import Channel
+
+    body = Channel.layout.build(
+        {
+            "version": 1,
+            "bump": 255,
+            "status": 0,
+            "salt": OPEN_FIXTURE_SALT,
+            "deposit": deposit,
+            "settlement": {"settled": 0, "payoutWatermark": 0},
+            "closureStartedAt": 0,
+            "payerWithdrawnAt": 0,
+            "gracePeriod": OPEN_FIXTURE_GRACE,
+            "distributionHash": list(hashlib.sha256(struct.pack("<I", 0)).digest()),
+            "payer": fixture.payer.pubkey(),
+            "payee": fixture.payee,
+            "authorizedSigner": fixture.authorized,
+            "mint": fixture.mint,
+            "rentPayer": fixture.payer.pubkey(),
+            "openSlot": OPEN_FIXTURE_SLOT,
+        }
+    )
+    return bytes([1]) + bytes(body), str(PROGRAM_ID)
 
 
 def _sign_and_attach(fixture: OpenTxFixture, ix: Instruction, v0: bool) -> tuple[str, OpenPayload]:
@@ -131,9 +159,7 @@ def _sign_and_attach(fixture: OpenTxFixture, ix: Instruction, v0: bool) -> tuple
     return signature, payload
 
 
-def build_open_tx_fixture(v0: bool, recipients: list[Distribution] | None = None) -> OpenTxFixture:
-    if recipients is None:
-        recipients = []
+def build_open_tx_fixture(v0: bool) -> OpenTxFixture:
     payer = _kp(1)
     payee = _kp(2).pubkey()
     authorized = _kp(3).pubkey()
@@ -151,7 +177,6 @@ def build_open_tx_fixture(v0: bool, recipients: list[Distribution] | None = None
             deposit=OPEN_FIXTURE_DEPOSIT,
             grace_period=OPEN_FIXTURE_GRACE,
             open_slot=OPEN_FIXTURE_SLOT,
-            recipients=recipients,
             token_program=Pubkey.from_string(TOKEN_PROGRAM),
             rent_payer=payer.pubkey(),
         )
@@ -176,7 +201,6 @@ def build_open_tx_fixture(v0: bool, recipients: list[Distribution] | None = None
         # operator is the expected rentPayer (required); the fixture pins
         # rentPayer to its own payer.
         operator=str(payer.pubkey()),
-        recipients=[(str(entry.recipient), entry.bps) for entry in recipients],
     )
     return fixture
 
@@ -224,31 +248,6 @@ async def test_verify_open_tx_honors_explicit_mint_and_program_overrides() -> No
     )
     result = await verify_open_tx(expected, fixture.payload, None)
     assert result.channel_id == str(fixture.channel)
-
-
-async def test_verify_open_tx_binds_all_ordered_distribution_recipients() -> None:
-    """Every Borsh recipient entry is part of the open commitment: swapping
-    entries or changing a share must reject before the server persists a channel
-    that would distribute to a different destination at close."""
-    recipients = [
-        Distribution(recipient=_kp(4).pubkey(), bps=2_500),
-        Distribution(recipient=_kp(5).pubkey(), bps=7_500),
-    ]
-    fixture = build_open_tx_fixture(v0=False, recipients=recipients)
-
-    accepted = await verify_open_tx(fixture.expected, fixture.payload, None)
-    assert accepted.channel_id == str(fixture.channel)
-
-    reordered = replace(fixture.expected, recipients=list(reversed(fixture.expected.recipients)))
-    with pytest.raises(PaymentError, match="open recipients"):
-        await verify_open_tx(reordered, fixture.payload, None)
-
-    changed_bps = replace(
-        fixture.expected,
-        recipients=[(fixture.expected.recipients[0][0], 2_499), fixture.expected.recipients[1]],
-    )
-    with pytest.raises(PaymentError, match="open recipients"):
-        await verify_open_tx(changed_bps, fixture.payload, None)
 
 
 async def test_verify_open_tx_rejects_address_lookup_tables() -> None:
@@ -572,7 +571,8 @@ class _OpenConfig:
     max_cap: int
     operator: str = ""
     program_id: Pubkey | None = None
-    splits: list[Split] = field(default_factory=list)
+    settlement_window: int = 900
+    splits: list[Any] = field(default_factory=list)
 
 
 def _open_session_config(fixture: OpenTxFixture) -> _OpenConfig:
@@ -626,105 +626,30 @@ async def test_new_open_tx_verifier_without_transaction_confirms_signature() -> 
 # -- new_top_up_tx_verifier ---------------------------------------------------
 
 
-@dataclass
-class _TopUpConfig:
-    program_id: Pubkey | None = None
-
-
-def _base58_encode(data: bytes) -> str:
-    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-    number = int.from_bytes(data, "big")
-    encoded = ""
-    while number:
-        number, remainder = divmod(number, 58)
-        encoded = alphabet[remainder] + encoded
-    leading_zeros = len(data) - len(data.lstrip(b"\0"))
-    return "1" * leading_zeros + (encoded or "1")
-
-
-def _confirmed_top_up_transaction(channel: Pubkey, amount: int) -> dict:
-    instruction = build_top_up_instruction(
-        TopUpParams(
-            payer=_kp(20).pubkey(),
-            channel=channel,
-            mint=Pubkey.from_string(USDC_MAINNET_MINT),
-            amount=amount,
-            token_program=Pubkey.from_string(TOKEN_PROGRAM),
-        )
+def _stored_channel(fixture: OpenTxFixture) -> ChannelState:
+    return ChannelState(
+        channel_id=str(fixture.channel),
+        authorized_signer=str(fixture.authorized),
+        deposit=OPEN_FIXTURE_DEPOSIT,
+        operator=str(fixture.payer.pubkey()),
     )
-    return {
-        "meta": {"err": None},
-        "transaction": {
-            "message": {
-                "instructions": [
-                    {
-                        "programId": str(instruction.program_id),
-                        "accounts": [str(account.pubkey) for account in instruction.accounts],
-                        "data": _base58_encode(bytes(instruction.data)),
-                    }
-                ]
-            }
-        },
-    }
-
-
-def _top_up_state(channel: Pubkey, deposit: int = 1_000_000) -> ChannelState:
-    return ChannelState(channel_id=str(channel), authorized_signer=str(_kp(21).pubkey()), deposit=deposit)
 
 
 def test_new_top_up_tx_verifier_none_rpc_disables_the_seam() -> None:
     """Mirrors TestNewTopUpTxVerifierNilRPCDisablesTheSeam."""
-    assert new_top_up_tx_verifier(_TopUpConfig(), None) is None
+    assert new_top_up_tx_verifier(None) is None
 
 
 async def test_new_top_up_tx_verifier_confirms_signature() -> None:
-    """A confirmed transaction must prove the configured program, exact channel,
-    and amount delta rather than merely carrying a successful signature."""
+    """Mirrors TestNewTopUpTxVerifierConfirmsSignature."""
     signature = _kp(20).sign_message(b"top-up")
-    channel = _kp(22).pubkey()
-    fake_rpc = _FakeRpc()
-    fake_rpc.transactions[str(signature)] = _confirmed_top_up_transaction(channel, 1_000_000)
-    verifier = new_top_up_tx_verifier(_TopUpConfig(), fake_rpc)
+    fixture = build_open_tx_fixture(v0=False)
+    fake = _FakeRpc()
+    fake.accounts[str(fixture.channel)] = _channel_account(fixture, 2_000_000)
+    verifier = new_top_up_state_tx_verifier(_open_session_config(fixture), fake)
     assert verifier is not None
-    payload = TopUpPayload(channel_id=str(channel), new_deposit="2000000", signature=str(signature))
-    await verifier(payload, _top_up_state(channel))
-
-
-@pytest.mark.parametrize(
-    ("mutation", "message"),
-    [
-        ("program", "topUp instruction"),
-        ("channel", "channel"),
-    ],
-)
-async def test_new_top_up_tx_verifier_rejects_foreign_program_or_channel(mutation: str, message: str) -> None:
-    signature = str(_kp(23).sign_message(b"top-up"))
-    channel = _kp(24).pubkey()
-    fake_rpc = _FakeRpc()
-    transaction = _confirmed_top_up_transaction(channel, 1_000_000)
-    instruction = transaction["transaction"]["message"]["instructions"][0]
-    if mutation == "program":
-        instruction["programId"] = str(_kp(30).pubkey())
-    else:
-        instruction["accounts"][1] = str(_kp(31).pubkey())
-    fake_rpc.transactions[signature] = transaction
-    verifier = new_top_up_tx_verifier(_TopUpConfig(), fake_rpc)
-    assert verifier is not None
-    payload = TopUpPayload(channel_id=str(channel), new_deposit="2000000", signature=signature)
-    with pytest.raises(PaymentError, match=message):
-        await verifier(payload, _top_up_state(channel))
-
-
-async def test_new_top_up_tx_verifier_rejects_delta_mismatch() -> None:
-    signature = str(_kp(25).sign_message(b"top-up"))
-    channel = _kp(26).pubkey()
-    fake_rpc = _FakeRpc()
-    fake_rpc.transactions[signature] = _confirmed_top_up_transaction(channel, 999_999)
-    verifier = new_top_up_tx_verifier(_TopUpConfig(), fake_rpc)
-    assert verifier is not None
-    payload = TopUpPayload(channel_id=str(channel), new_deposit="2000000", signature=signature)
-    with pytest.raises(PaymentError, match="amount"):
-        await verifier(payload, _top_up_state(channel))
+    payload = TopUpPayload(channel_id=str(fixture.channel), new_deposit="2000000", signature=str(signature))
+    await verifier(payload, _stored_channel(fixture))
 
 
 async def test_new_top_up_tx_verifier_surfaces_failure_and_not_found() -> None:
@@ -732,16 +657,19 @@ async def test_new_top_up_tx_verifier_surfaces_failure_and_not_found() -> None:
     signature = str(_kp(21).sign_message(b"top-up"))
     fake_rpc = _FakeRpc()
     fake_rpc.statuses[signature] = {"err": "InstructionError"}
-    verifier = new_top_up_tx_verifier(_TopUpConfig(), fake_rpc)
+    fixture = build_open_tx_fixture(v0=False)
+    verifier = new_top_up_state_tx_verifier(_open_session_config(fixture), fake_rpc)
     assert verifier is not None
-    channel = _kp(27).pubkey()
-    payload = TopUpPayload(channel_id=str(channel), new_deposit="2000000", signature=signature)
+    payload = TopUpPayload(channel_id="chan", new_deposit="2000000", signature=signature)
     with pytest.raises(PaymentError, match="top-up"):
-        await verifier(payload, _top_up_state(channel))
+        await verifier(payload, _stored_channel(fixture))
 
     fake_rpc.statuses[signature] = None
     with pytest.raises(PaymentError, match="not found"):
-        await verifier(payload, _top_up_state(channel))
+        await verifier(payload, _stored_channel(fixture))
 
     with pytest.raises(PaymentError, match="invalid top-up tx signature"):
-        await verifier(TopUpPayload(channel_id="", new_deposit="", signature="not-base58!"), _top_up_state(channel))
+        await verifier(
+            TopUpPayload(channel_id="", new_deposit="1", signature="not-base58!"),
+            _stored_channel(fixture),
+        )
