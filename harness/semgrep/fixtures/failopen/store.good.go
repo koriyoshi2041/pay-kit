@@ -3,7 +3,10 @@ package server
 // GOOD: a shared/persistent store is REQUIRED. No silent in-memory fallback —
 // mis-configuration fails CLOSED (error) rather than fanning out per-process.
 
-import "errors"
+import (
+	"errors"
+	"os"
+)
 
 type Config struct {
 	Store SessionStore
@@ -21,4 +24,21 @@ func NewServer(config Config) (*Server, error) {
 func newSingleProcessMethod() *Method {
 	store := NewMemoryChannelStore()
 	return &Method{store: store}
+}
+
+// GOOD: a local-memory fallback may exist only behind a concrete off-localnet
+// rejection and a deliberate environment opt-in.
+func newGuardedMethod(options Options, network string) (*Method, error) {
+	store := options.Store
+	usesMemoryStore := false
+	if store != nil {
+		_, usesMemoryStore = store.(*MemoryChannelStore)
+	}
+	if network != "localnet" && (store == nil || usesMemoryStore) && os.Getenv("ALLOW_MEMORY") != "1" {
+		return nil, errors.New("shared SessionStore required")
+	}
+	if store == nil {
+		store = NewMemoryChannelStore()
+	}
+	return &Method{store: store}, nil
 }
