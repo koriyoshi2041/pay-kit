@@ -14,7 +14,7 @@
  * (same as the rest of the surfpool CI; defaults to public mainnet).
  */
 import { generateKeyPairSigner, type KeyPairSigner } from "@solana/kit";
-import { createPayKit, usage, usd } from "@solana/pay-kit";
+import { createMemoryReplayStore, createPayKit, usage, usd } from "@solana/pay-kit";
 import { createPayKitClient } from "@solana/pay-kit/client";
 import express, { type Request, type Response } from "express";
 import type { Server } from "node:http";
@@ -46,6 +46,7 @@ describe("on-chain datasource RPC config", () => {
 });
 
 async function startServer(): Promise<void> {
+  const replayStore = { ...createMemoryReplayStore(), isShared: true as const };
   const pay = await createPayKit({
     accept: ["x402", "mpp"],
     mpp: { challengeBindingSecret: crypto.randomBytes(32).toString("hex") },
@@ -58,6 +59,7 @@ async function startServer(): Promise<void> {
       // Fixed charge baseline (MPP / x402 exact — SPL transfer).
       fortune: { amount: usd("0.01"), description: "A fortune cookie" },
     },
+    replayStore,
     rpcUrl: net.rpcUrl,
   });
 
