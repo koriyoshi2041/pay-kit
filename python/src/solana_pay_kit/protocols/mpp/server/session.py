@@ -348,6 +348,8 @@ class SessionServer:
         if payment_channel_backed and self._config.verify_open_tx is not None:
             try:
                 await self._config.verify_open_tx(payload)
+            except PaymentError:
+                raise
             except Exception as exc:
                 raise _wrap("open tx verification failed", exc) from exc
 
