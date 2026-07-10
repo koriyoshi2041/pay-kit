@@ -42,3 +42,21 @@ func newGuardedMethod(options Options, network string) (*Method, error) {
 	}
 	return &Method{store: store}, nil
 }
+
+// GOOD: callers may combine an explicit option with an environment override
+// before the fail-closed branch, rather than repeating os.Getenv in it.
+func newGuardedMethodWithOption(options Options, network string) (*Method, error) {
+	store := options.Store
+	allowUnsafe := options.AllowUnsafe || os.Getenv("ALLOW_MEMORY") == "1"
+	usesMemoryStore := false
+	if store != nil {
+		_, usesMemoryStore = store.(*MemoryChannelStore)
+	}
+	if network != "localnet" && (store == nil || usesMemoryStore) && !allowUnsafe {
+		return nil, errors.New("shared SessionStore required")
+	}
+	if store == nil {
+		store = NewMemoryChannelStore()
+	}
+	return &Method{store: store}, nil
+}
