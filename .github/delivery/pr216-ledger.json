@@ -36,8 +36,8 @@
       "obsolete_test_only": 2
     },
     "paths": {
-      "integrated": 28,
-      "open_pr": 110,
+      "integrated": 27,
+      "open_pr": 111,
       "superseded": 99
     }
   },
@@ -4399,28 +4399,18 @@
     {
       "path": "harness/php-server/server.php",
       "bucket": "php",
-      "status": "integrated",
+      "status": "open_pr",
       "evidence": [
         {
-          "kind": "identical-tree-entry",
-          "sourceBlob": "959c9d54abb8c272d0abfef2da6dfcbe54336661",
-          "deliveryBlob": "959c9d54abb8c272d0abfef2da6dfcbe54336661",
-          "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:harness/php-server/server.php",
-          "deliveryRef": "ba3b5d9dac7d70c4deabb9adbeecf9ed8978c92f:harness/php-server/server.php",
-          "detail": "The authoritative source-tip and current #233 delivery-baseline blobs are identical; integration is established by exact object identity."
-        },
-        {
-          "kind": "merged-stacked-base-tree-entry",
-          "pr": 219,
-          "branch": "split/pr216-ci-harness-mega",
-          "deliveryCommit": "9e38dea31788d5aa52770b7da23fea7e64af122b",
-          "sourceBlob": "959c9d54abb8c272d0abfef2da6dfcbe54336661",
-          "deliveryBlob": "959c9d54abb8c272d0abfef2da6dfcbe54336661",
-          "sourceRef": "45ad8c9acd7a71d4dd12b87321a9902c71fef865:harness/php-server/server.php",
-          "deliveryRef": "9e38dea31788d5aa52770b7da23fea7e64af122b:harness/php-server/server.php",
-          "detail": "Stacked base #219 commit 9e38dea31788d5aa52770b7da23fea7e64af122b is merged into the current #233 delivery history; this evidence records its exact source-tree state at that immutable commit."
+          "kind": "open-delivery-head",
+          "pr": 237,
+          "branch": "fix/mpp-replay-store-hardening",
+          "deliveryCommit": "5981d47",
+          "detail": "PR #237 intentionally supersedes the original harness PHP replay fixture with an explicit development opt-in while production capability checks remain fail-closed."
         }
-      ]
+      ],
+      "owner": "PR #237 / fix/mpp-replay-store-hardening",
+      "followUp": "Land PR #237, then revalidate the hardened harness fixture on #219."
     },
     {
       "path": "harness/pnpm-lock.yaml",
