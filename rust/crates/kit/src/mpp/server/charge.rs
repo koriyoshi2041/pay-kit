@@ -227,10 +227,14 @@ pub struct Config {
     pub recipient_signer: Option<Arc<dyn solana_keychain::SolanaSigner>>,
     /// Replay-protection store.
     ///
-    /// Localnet defaults to [`MemoryStore`]. Mainnet and devnet require an
-    /// explicitly [`ReplayStoreCapability::DurableShared`] store so replay
-    /// reservations survive restarts and worker pools.
+    /// Every server must inject an atomic store that explicitly declares
+    /// [`ReplayStoreCapability::DurableShared`] unless
+    /// `allow_unsafe_memory_store` is an explicit development override.
+    /// Localnet alone does not opt in.
     pub store: Option<Arc<dyn Store>>,
+    /// Explicit development/test opt-in for process-local replay state.
+    /// Never enable this in a multi-instance deployment.
+    pub allow_unsafe_memory_store: bool,
     /// Enable HTML payment link pages for browser requests.
     pub html: bool,
     /// Audit #5: accept push-mode (`type=signature`) credentials.
@@ -263,6 +267,7 @@ impl Default for Config {
             fee_payer_signer: None,
             recipient_signer: None,
             store: None,
+            allow_unsafe_memory_store: false,
             html: false,
             accept_push_mode: false,
         }
@@ -363,23 +368,28 @@ impl Mpp {
             None => derive_default_realm(&config.recipient),
         };
         let store: Arc<dyn Store> = match config.store {
-            Some(store) => {
-                if config.network != "localnet"
-                    && store.replay_store_capability() != ReplayStoreCapability::DurableShared
-                {
-                    return Err(Error::InvalidConfig(
-                        "Config.store must explicitly declare durable shared replay protection outside localnet"
-                            .into(),
-                    ));
-                }
-                store
+            Some(store)
+                if store.replay_store_capability() != ReplayStoreCapability::DurableShared
+                    && !config.allow_unsafe_memory_store =>
+            {
+                return Err(Error::InvalidConfig(format!(
+                    "an atomic durable shared replay store is required on {}; Store::replay_store_capability() must affirmatively return DurableShared unless allow_unsafe_memory_store is explicitly enabled for development",
+                    config.network
+                )));
             }
-            None if config.network == "localnet" => Arc::new(MemoryStore::new()),
+            Some(store) => store,
+            None if config.allow_unsafe_memory_store => {
+                eprintln!(
+                    "[pay-kit] WARNING: MPP on {} explicitly enabled process-local MemoryStore; replay markers are lost on restart and are not shared across workers",
+                    config.network
+                );
+                Arc::new(MemoryStore::new())
+            }
             None => {
-                return Err(Error::InvalidConfig(
-                    "Config.store is required outside localnet; inject a durable shared replay store"
-                        .into(),
-                ));
+                return Err(Error::InvalidConfig(format!(
+                    "an atomic durable shared replay store is required on {}; inject Config.store or explicitly enable allow_unsafe_memory_store for development",
+                    config.network
+                )));
             }
         };
 
@@ -3221,6 +3231,7 @@ impl std::error::Error for VerificationError {}
 #[allow(clippy::err_expect)]
 mod tests {
     use super::*;
+    use crate::mpp::store::StoreError;
 
     #[derive(Default)]
     struct UnspecifiedTestStore {
@@ -4034,6 +4045,7 @@ mod tests {
     async fn bundle_rejected_when_challenge_not_confidential() {
         let recipient = Pubkey::new_unique();
         let mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: recipient.to_string(),
             currency: "SOL".to_string(),
             decimals: 6,
@@ -4783,8 +4795,57 @@ mod tests {
     const TEST_SECRET: &str = "test-secret-key-for-unit-tests-with-32b-padding";
     const TEST_RECIPIENT: &str = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
 
+    struct SharedTestStore(MemoryStore);
+
+    impl Store for SharedTestStore {
+        fn is_shared(&self) -> bool {
+            true
+        }
+
+        fn get(
+            &self,
+            key: &str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Option<serde_json::Value>, StoreError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.0.get(key)
+        }
+
+        fn put(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StoreError>> + Send + '_>>
+        {
+            self.0.put(key, value)
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StoreError>> + Send + '_>>
+        {
+            self.0.delete(key)
+        }
+
+        fn put_if_absent(
+            &self,
+            key: &str,
+            value: serde_json::Value,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, StoreError>> + Send + '_>,
+        > {
+            self.0.put_if_absent(key, value)
+        }
+    }
+
     fn test_mpp() -> Mpp {
         Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             network: "devnet".to_string(),
@@ -4796,6 +4857,7 @@ mod tests {
 
     fn test_mpp_sol() -> Mpp {
         Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: "SOL".to_string(),
@@ -4823,6 +4885,7 @@ mod tests {
     #[test]
     fn new_missing_recipient_errors() {
         let err = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: String::new(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             ..Default::default()
@@ -4838,6 +4901,7 @@ mod tests {
     #[test]
     fn new_invalid_recipient_pubkey_errors() {
         let err = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: "not-a-valid-pubkey!!!".to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             ..Default::default()
@@ -4858,6 +4922,7 @@ mod tests {
         unsafe { std::env::remove_var(SECRET_KEY_ENV_VAR) };
 
         let err = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: None,
             store: Some(durable_store()),
@@ -4885,6 +4950,7 @@ mod tests {
         };
 
         let result = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: None,
             store: Some(durable_store()),
@@ -4905,6 +4971,7 @@ mod tests {
     fn new_rejects_empty_secret_key() {
         // Audit #24: short keys weaken the HMAC binding.
         let err = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(String::new()),
             ..Default::default()
@@ -4922,6 +4989,7 @@ mod tests {
         // Just below the 32-byte minimum.
         let short = "a".repeat(MIN_SECRET_KEY_BYTES - 1);
         let err = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(short),
             ..Default::default()
@@ -4938,6 +5006,7 @@ mod tests {
     fn new_accepts_secret_key_at_minimum_length() {
         let exact = "a".repeat(MIN_SECRET_KEY_BYTES);
         let result = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(exact),
             store: Some(durable_store()),
@@ -4954,6 +5023,7 @@ mod tests {
         unsafe { std::env::set_var(SECRET_KEY_ENV_VAR, "too-short") };
 
         let result = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: None,
             store: Some(durable_store()),
@@ -4986,6 +5056,7 @@ mod tests {
     #[test]
     fn new_custom_realm() {
         let mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             realm: Some("Custom Realm".to_string()),
@@ -5039,6 +5110,7 @@ mod tests {
         // reject so an operator can't reintroduce the audit threat with a
         // typo.
         let err = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             realm: Some(String::new()),
@@ -5058,6 +5130,7 @@ mod tests {
     fn new_accepts_canonical_networks() {
         for net in ["mainnet", "devnet", "localnet"] {
             Mpp::new(Config {
+                allow_unsafe_memory_store: true,
                 recipient: TEST_RECIPIENT.to_string(),
                 challenge_binding_secret: Some(TEST_SECRET.to_string()),
                 network: net.to_string(),
@@ -5071,6 +5144,7 @@ mod tests {
     #[test]
     fn new_rejects_unknown_network() {
         let err = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             network: "testnet".to_string(),
@@ -5084,6 +5158,7 @@ mod tests {
     #[test]
     fn new_rejects_empty_network() {
         let err = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             network: String::new(),
@@ -5102,6 +5177,7 @@ mod tests {
         // Audit #37: canonicalize on "mainnet" — the legacy "mainnet-beta"
         // is an RPC hostname, not a wire-format slug.
         let err = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             network: "mainnet-beta".to_string(),
@@ -5116,6 +5192,7 @@ mod tests {
     fn new_custom_rpc_url() {
         // Should not fail — just verifying it accepts a custom RPC URL.
         let mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             rpc_url: Some("http://custom:8899".to_string()),
@@ -5128,6 +5205,7 @@ mod tests {
     #[test]
     fn new_accepts_explicit_durable_shared_store() {
         let result = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             store: Some(durable_store()),
@@ -5137,52 +5215,40 @@ mod tests {
     }
 
     #[test]
-    fn new_localnet_allows_implicit_memory_store() {
-        let mpp = Mpp::new(Config {
+    fn new_rejects_missing_replay_store_outside_localnet() {
+        let err = Mpp::new(Config {
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
-            network: "localnet".to_string(),
+            currency: "SOL".to_string(),
+            network: "mainnet".to_string(),
             ..Default::default()
         })
-        .expect("localnet may use the memory-store fallback");
-
-        assert_eq!(
-            mpp.store.replay_store_capability(),
-            ReplayStoreCapability::Ephemeral
+        .err()
+        .expect("missing production replay store should fail");
+        assert!(
+            err.to_string()
+                .contains("atomic durable shared replay store"),
+            "got: {err}"
         );
     }
 
     #[test]
-    fn new_non_localnet_rejects_missing_replay_store() {
+    fn new_rejects_memory_store_outside_localnet() {
         let err = Mpp::new(Config {
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
-            network: "devnet".to_string(),
-            ..Default::default()
-        })
-        .err()
-        .expect("devnet must not fall back to MemoryStore");
-
-        assert!(err
-            .to_string()
-            .contains("Config.store is required outside localnet"));
-    }
-
-    #[test]
-    fn new_non_localnet_rejects_memory_store() {
-        let err = Mpp::new(Config {
-            recipient: TEST_RECIPIENT.to_string(),
-            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: "SOL".to_string(),
             network: "devnet".to_string(),
             store: Some(Arc::new(MemoryStore::new())),
             ..Default::default()
         })
         .err()
-        .expect("devnet MemoryStore is process-local");
-
-        assert!(err
-            .to_string()
-            .contains("must explicitly declare durable shared replay protection"));
+        .expect("process-local production replay store should fail");
+        assert!(
+            err.to_string()
+                .contains("must affirmatively return DurableShared"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -5197,9 +5263,53 @@ mod tests {
         .err()
         .expect("custom stores are unsafe until they explicitly declare the capability");
 
+        assert!(
+            err.to_string()
+                .contains("must affirmatively return DurableShared"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn new_rejects_implicit_localnet_memory_store() {
+        let err = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: "SOL".to_string(),
+            network: "localnet".to_string(),
+            ..Default::default()
+        })
+        .err()
+        .expect("localnet still requires explicit unsafe opt-in");
         assert!(err
             .to_string()
-            .contains("must explicitly declare durable shared replay protection"));
+            .contains("atomic durable shared replay store"));
+    }
+
+    #[test]
+    fn new_allows_explicit_development_memory_store() {
+        let result = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: "SOL".to_string(),
+            network: "devnet".to_string(),
+            allow_unsafe_memory_store: true,
+            ..Default::default()
+        });
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn new_allows_injected_shared_store_outside_localnet() {
+        let result = Mpp::new(Config {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            currency: "SOL".to_string(),
+            network: "mainnet".to_string(),
+            store: Some(Arc::new(SharedTestStore(MemoryStore::new()))),
+            ..Default::default()
+        });
+        assert!(result.is_ok());
     }
 
     // ── resolve_server_token_program tests (sync branches only) ──
@@ -5207,6 +5317,7 @@ mod tests {
     #[test]
     fn new_resolves_token_program_for_sol_currency() {
         let mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: "SOL".to_string(),
@@ -5230,6 +5341,7 @@ mod tests {
         // PYUSD is Token-2022; if this returns the legacy Token Program
         // (the old bug), the regression is back.
         let mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: "PYUSD".to_string(),
@@ -5246,6 +5358,7 @@ mod tests {
         // Not a known symbol and not a valid base58 pubkey — must reject
         // up front, never silently fall back to the legacy Token Program.
         let err = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: "not-a-symbol-or-mint!!".to_string(),
@@ -5265,6 +5378,7 @@ mod tests {
     #[test]
     fn new_rejects_fee_payer_true_without_signer() {
         let err = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             fee_payer: true,
@@ -5300,6 +5414,7 @@ mod tests {
         // Regression: the default config has no signer and fee_payer=false;
         // it must keep working.
         let mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             fee_payer: false,
@@ -5317,6 +5432,7 @@ mod tests {
         // Mpp is configured fee_payer=false, no signer. A per-call
         // ChargeOptions.fee_payer = true override must be rejected.
         let mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             fee_payer: false,
@@ -5346,6 +5462,7 @@ mod tests {
     fn charge_options_fee_payer_succeeds_when_signer_configured() {
         // Happy path: server has a signer, per-call override works.
         let mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             fee_payer: false,
@@ -6607,6 +6724,7 @@ mod tests {
         // (e.g. on-chain verification against a fake signature) is fine,
         // just not the "Push-mode credentials are disabled" one.
         let mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: crate::mpp::protocol::solana::mints::USDC_DEVNET.to_string(),
@@ -6651,6 +6769,7 @@ mod tests {
         // the B34 fee-payer-specific path in isolation, opt push mode in
         // here so the audit #5 gate passes and B34 fires.
         let mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: crate::mpp::protocol::solana::mints::USDC_DEVNET.to_string(),
@@ -6691,6 +6810,7 @@ mod tests {
         // We do not drive broadcast here, only assert the early reject does
         // not fire: any error must come from broadcast, not from B34.
         let mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: crate::mpp::protocol::solana::mints::USDC_DEVNET.to_string(),
@@ -6727,6 +6847,7 @@ mod tests {
     async fn replay_protection_marks_and_detects_consumed() {
         let store = Arc::new(DurableSharedTestStore::default());
         let _mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             store: Some(store.clone()),
@@ -6760,6 +6881,7 @@ mod tests {
 
         let mpp = Arc::new(
             Mpp::new(Config {
+                allow_unsafe_memory_store: true,
                 recipient: TEST_RECIPIENT.to_string(),
                 challenge_binding_secret: Some(TEST_SECRET.to_string()),
                 store: Some(durable_store()),
@@ -8216,6 +8338,7 @@ mod tests {
     #[test]
     fn charge_with_fee_payer_includes_method_details() {
         let mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             fee_payer: true,
@@ -8239,6 +8362,7 @@ mod tests {
         // Audit #16: per-call ChargeOptions.fee_payer requires the server
         // to have a signer configured.
         let mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             fee_payer_signer: Some(test_fee_payer_signer()),
@@ -8266,6 +8390,7 @@ mod tests {
     fn charge_with_split_ata_creation_includes_method_details() {
         let split_recipient = Pubkey::new_unique();
         let mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: crate::mpp::protocol::solana::mints::USDC_DEVNET.to_string(),
@@ -8310,6 +8435,7 @@ mod tests {
     fn charge_variants_with_options_returns_single_challenge() {
         let split_recipient = Pubkey::new_unique();
         let mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: crate::mpp::protocol::solana::mints::USDC_DEVNET.to_string(),
@@ -8343,6 +8469,7 @@ mod tests {
     fn charge_with_split_ata_creation_rejects_symbol_currency() {
         let split_recipient = Pubkey::new_unique();
         let mpp = Mpp::new(Config {
+            allow_unsafe_memory_store: true,
             recipient: TEST_RECIPIENT.to_string(),
             challenge_binding_secret: Some(TEST_SECRET.to_string()),
             currency: "USDC".to_string(),

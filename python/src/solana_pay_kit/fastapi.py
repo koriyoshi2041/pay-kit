@@ -141,10 +141,11 @@ class PaywallConfig:
     gate_ref: Gate | DynamicGate | Price | str | Callable[[Request], Gate] | None = None
     pricing: Pricing | None = None
     config: Config | None = None
+    mpp_replay_store: Store | None = None
+    x402_replay_store: Store | None = None
     default_policy: PaywallDefaultPolicy = "public"
     paid_tags: tuple[str, ...] = ("paid", "pay")
     public_tags: tuple[str, ...] = ("public", "free")
-    x402_replay_store: Store | None = None
     x402_replay_store_factory: X402ReplayStoreFactory | None = None
 
 
@@ -195,6 +196,7 @@ def RequirePayment(  # noqa: N802 - factory reads as a dependency constructor
     *,
     pricing: Pricing | None = None,
     config: Config | None = None,
+    mpp_replay_store: Store | None = None,
     x402_replay_store: Store | None = None,
     x402_replay_store_factory: X402ReplayStoreFactory | None = None,
 ) -> Callable[..., Any]:
@@ -210,6 +212,7 @@ def RequirePayment(  # noqa: N802 - factory reads as a dependency constructor
     async def dependency(request: Request) -> Payment:
         core = PayCore.for_config(
             config if config is not None else _config(),
+            mpp_replay_store=mpp_replay_store,
             x402_replay_store=x402_replay_store,
             x402_replay_store_factory=x402_replay_store_factory,
         )
@@ -343,6 +346,8 @@ def install_paywall_from_config(
     paywall: PaywallConfig,
     *,
     cors_origins: Sequence[str] | None = ("*",),
+    mpp_replay_store: Store | None = None,
+    x402_replay_store: Store | None = None,
 ) -> None:
     """Install a Django/DRF-style paywall over an existing FastAPI app.
 
@@ -374,20 +379,23 @@ def install_paywall_from_config(
             )
         pricing = requirement.pricing if requirement.pricing is not None else paywall.pricing
         config = requirement.config if requirement.config is not None else paywall.config
-        replay_store = (
-            requirement.x402_replay_store
-            if requirement.x402_replay_store is not None
-            else paywall.x402_replay_store
-        )
-        replay_store_factory = (
-            requirement.x402_replay_store_factory
-            if requirement.x402_replay_store_factory is not None
-            else paywall.x402_replay_store_factory
-        )
+        resolved_mpp_store = mpp_replay_store if mpp_replay_store is not None else paywall.mpp_replay_store
+        resolved_x402_store = requirement.x402_replay_store
+        if resolved_x402_store is None:
+            resolved_x402_store = x402_replay_store
+        if resolved_x402_store is None:
+            resolved_x402_store = paywall.x402_replay_store
+
+        resolved_x402_factory = None
+        if resolved_x402_store is None:
+            resolved_x402_factory = requirement.x402_replay_store_factory
+            if resolved_x402_factory is None:
+                resolved_x402_factory = paywall.x402_replay_store_factory
         core = PayCore.for_config(
             config if config is not None else _config(),
-            x402_replay_store=replay_store,
-            x402_replay_store_factory=replay_store_factory,
+            mpp_replay_store=resolved_mpp_store,
+            x402_replay_store=resolved_x402_store,
+            x402_replay_store_factory=resolved_x402_factory,
         )
 
         try:
@@ -429,6 +437,7 @@ def install_paywall(
     paid_tags: tuple[str, ...] = ("paid", "pay"),
     public_tags: tuple[str, ...] = ("public", "free"),
     cors_origins: Sequence[str] | None = ("*",),
+    mpp_replay_store: Store | None = None,
     x402_replay_store: Store | None = None,
     x402_replay_store_factory: X402ReplayStoreFactory | None = None,
 ) -> None:
@@ -448,6 +457,7 @@ def install_paywall(
         PaywallConfig(
             gate_ref=pay_config.gate_ref(),
             config=pay_config.build_config(preserve_global=True),
+            mpp_replay_store=mpp_replay_store,
             default_policy=default_policy,
             paid_tags=paid_tags,
             public_tags=public_tags,

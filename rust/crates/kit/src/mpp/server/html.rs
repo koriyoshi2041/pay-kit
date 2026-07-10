@@ -255,6 +255,7 @@ mod tests {
             ),
             network: "localnet".to_string(),
             html: true,
+            allow_unsafe_memory_store: true,
             ..Default::default()
         })
         .unwrap();

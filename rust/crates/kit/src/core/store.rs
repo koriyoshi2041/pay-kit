@@ -31,9 +31,24 @@ pub trait Store: Send + Sync {
     ///
     /// Custom implementations default to [`ReplayStoreCapability::Unspecified`]
     /// and are rejected outside localnet until they explicitly declare
-    /// [`ReplayStoreCapability::DurableShared`].
+    /// [`ReplayStoreCapability::DurableShared`]. Implementations using the
+    /// legacy [`Store::is_shared`] declaration remain source-compatible.
     fn replay_store_capability(&self) -> ReplayStoreCapability {
-        ReplayStoreCapability::Unspecified
+        if self.is_shared() {
+            ReplayStoreCapability::DurableShared
+        } else {
+            ReplayStoreCapability::Unspecified
+        }
+    }
+
+    /// Whether this implementation is atomic and shared across all server
+    /// instances that can accept the same credential.
+    ///
+    /// This compatibility hook predates [`ReplayStoreCapability`]. New stores
+    /// should implement `replay_store_capability`; unknown stores default to
+    /// false and are rejected by production charge construction.
+    fn is_shared(&self) -> bool {
+        false
     }
 
     fn get(

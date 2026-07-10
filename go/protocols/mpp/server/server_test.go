@@ -37,13 +37,14 @@ func newTestMpp(t *testing.T) (*Mpp, *testutil.FakeRPC, testutilConfig) {
 		SecretKey: "test-secret-key-0123456789abcdef",
 	}
 	handler, err := New(Config{
-		Recipient: cfg.Recipient,
-		Currency:  "sol",
-		Decimals:  9,
-		Network:   "localnet",
-		SecretKey: cfg.SecretKey,
-		RPC:       rpcClient,
-		Store:     core.NewMemoryStore(),
+		Recipient:              cfg.Recipient,
+		Currency:               "sol",
+		Decimals:               9,
+		Network:                "localnet",
+		SecretKey:              cfg.SecretKey,
+		RPC:                    rpcClient,
+		Store:                  core.NewMemoryStore(),
+		AllowUnsafeMemoryStore: true,
 		// Push-mode (type="signature") credentials are opt-in (#5); the shared
 		// fixture enables them so the signature-flow tests exercise settlement.
 		AcceptPushMode: true,
@@ -59,6 +60,15 @@ type testutilConfig struct {
 	Client    solana.PrivateKey
 	SecretKey string
 }
+
+// sharedTestStore models an operator-injected shared Store. Embedding the
+// memory implementation keeps this constructor test focused on store
+// selection; production implementations use Redis, Postgres, or equivalent.
+type sharedTestStore struct {
+	*core.MemoryStore
+}
+
+func (*sharedTestStore) IsShared() bool { return true }
 
 func newTestTransaction(t *testing.T, payer solana.PrivateKey, instructions ...solana.Instruction) *solana.Transaction {
 	t.Helper()
@@ -224,14 +234,15 @@ func TestVerifyCredentialRejectsSponsoredPushMode(t *testing.T) {
 	recipient := testutil.NewPrivateKey()
 	feePayer := testutil.NewPrivateKey()
 	handler, err := New(Config{
-		Recipient:      recipient.PublicKey().String(),
-		Currency:       "sol",
-		Decimals:       9,
-		Network:        "localnet",
-		SecretKey:      "test-secret-key-0123456789abcdef",
-		RPC:            rpcClient,
-		Store:          core.NewMemoryStore(),
-		FeePayerSigner: feePayer,
+		Recipient:              recipient.PublicKey().String(),
+		Currency:               "sol",
+		Decimals:               9,
+		Network:                "localnet",
+		SecretKey:              "test-secret-key-0123456789abcdef",
+		RPC:                    rpcClient,
+		Store:                  core.NewMemoryStore(),
+		AllowUnsafeMemoryStore: true,
+		FeePayerSigner:         feePayer,
 	})
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
@@ -259,14 +270,15 @@ func TestVerifyCredentialTokenSignatureSuccess(t *testing.T) {
 	mint := testutil.NewPrivateKey().PublicKey()
 	rpcClient.MintOwners[mint.String()] = solana.TokenProgramID
 	handler, err := New(Config{
-		Recipient:      recipient.PublicKey().String(),
-		Currency:       mint.String(),
-		Decimals:       6,
-		Network:        "localnet",
-		SecretKey:      "test-secret-key-0123456789abcdef",
-		RPC:            rpcClient,
-		Store:          core.NewMemoryStore(),
-		AcceptPushMode: true,
+		Recipient:              recipient.PublicKey().String(),
+		Currency:               mint.String(),
+		Decimals:               6,
+		Network:                "localnet",
+		SecretKey:              "test-secret-key-0123456789abcdef",
+		RPC:                    rpcClient,
+		Store:                  core.NewMemoryStore(),
+		AllowUnsafeMemoryStore: true,
+		AcceptPushMode:         true,
 	})
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
@@ -299,14 +311,15 @@ func TestVerifyCredentialUSDCSymbolSignatureSuccess(t *testing.T) {
 	usdcMint := solana.MustPublicKeyFromBase58("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
 	rpcClient.MintOwners[usdcMint.String()] = solana.TokenProgramID
 	handler, err := New(Config{
-		Recipient:      recipient.PublicKey().String(),
-		Currency:       "USDC",
-		Decimals:       6,
-		Network:        "localnet",
-		SecretKey:      "test-secret-key-0123456789abcdef",
-		RPC:            rpcClient,
-		Store:          core.NewMemoryStore(),
-		AcceptPushMode: true,
+		Recipient:              recipient.PublicKey().String(),
+		Currency:               "USDC",
+		Decimals:               6,
+		Network:                "localnet",
+		SecretKey:              "test-secret-key-0123456789abcdef",
+		RPC:                    rpcClient,
+		Store:                  core.NewMemoryStore(),
+		AllowUnsafeMemoryStore: true,
+		AcceptPushMode:         true,
 	})
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
@@ -622,12 +635,101 @@ func TestNewSecretKeyFromEnv(t *testing.T) {
 	t.Setenv(allowInMemoryReplayStoreEnvVar, "1")
 	recipient := testutil.NewPrivateKey().PublicKey().String()
 	rpcClient := testutil.NewFakeRPC()
-	handler, err := New(Config{Recipient: recipient, RPC: rpcClient, Store: core.NewMemoryStore()})
+	handler, err := New(Config{
+		Recipient: recipient, Network: "localnet", RPC: rpcClient,
+		AllowUnsafeMemoryStore: true,
+	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if handler.secretKey != envSecret {
 		t.Fatalf("expected env secret, got %q", handler.secretKey)
+	}
+}
+
+func TestNewRequiresAtomicSharedStore(t *testing.T) {
+	recipient := testutil.NewPrivateKey().PublicKey().String()
+	for _, network := range []string{"devnet", "mainnet"} {
+		t.Run(network, func(t *testing.T) {
+			_, err := New(Config{
+				Recipient: recipient,
+				Currency:  "sol",
+				Network:   network,
+				SecretKey: "test-secret-key-0123456789abcdef",
+				RPC:       testutil.NewFakeRPC(),
+			})
+			if err == nil || !strings.Contains(err.Error(), "atomic shared replay store") {
+				t.Fatalf("New() error = %v, want atomic shared replay store rejection", err)
+			}
+		})
+	}
+}
+
+func TestNewRejectsMemoryStoreOutsideLocalnet(t *testing.T) {
+	recipient := testutil.NewPrivateKey().PublicKey().String()
+	_, err := New(Config{
+		Recipient: recipient,
+		Currency:  "sol",
+		Network:   "mainnet",
+		SecretKey: "test-secret-key-0123456789abcdef",
+		RPC:       testutil.NewFakeRPC(),
+		Store:     core.NewMemoryStore(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "IsShared() == true") {
+		t.Fatalf("New() error = %v, want unknown/local store rejection", err)
+	}
+}
+
+func TestNewRejectsImplicitLocalnetMemoryStore(t *testing.T) {
+	recipient := testutil.NewPrivateKey().PublicKey().String()
+	_, err := New(Config{
+		Recipient: recipient,
+		Currency:  "sol",
+		Network:   "localnet",
+		SecretKey: "test-secret-key-0123456789abcdef",
+		RPC:       testutil.NewFakeRPC(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "atomic shared replay store") {
+		t.Fatalf("New() localnet error = %v, want explicit-store rejection", err)
+	}
+}
+
+func TestNewAllowsExplicitUnsafeMemoryStore(t *testing.T) {
+	recipient := testutil.NewPrivateKey().PublicKey().String()
+	store := core.NewMemoryStore()
+	handler, err := New(Config{
+		Recipient:              recipient,
+		Currency:               "sol",
+		Network:                "localnet",
+		SecretKey:              "test-secret-key-0123456789abcdef",
+		RPC:                    testutil.NewFakeRPC(),
+		Store:                  store,
+		AllowUnsafeMemoryStore: true,
+	})
+	if err != nil {
+		t.Fatalf("New() explicit unsafe development store error = %v", err)
+	}
+	if handler.store != store {
+		t.Fatal("New() did not preserve the explicit unsafe MemoryStore")
+	}
+}
+
+func TestNewAllowsInjectedStoreOutsideLocalnet(t *testing.T) {
+	recipient := testutil.NewPrivateKey().PublicKey().String()
+	store := &sharedTestStore{MemoryStore: core.NewMemoryStore()}
+	handler, err := New(Config{
+		Recipient: recipient,
+		Currency:  "sol",
+		Network:   "mainnet",
+		SecretKey: "test-secret-key-0123456789abcdef",
+		RPC:       testutil.NewFakeRPC(),
+		Store:     store,
+	})
+	if err != nil {
+		t.Fatalf("New() injected store error = %v", err)
+	}
+	if handler.store != store {
+		t.Fatal("New() did not preserve the injected replay store")
 	}
 }
 
@@ -652,7 +754,8 @@ func TestNewDefaultReplayStorePolicy(t *testing.T) {
 		{name: "mainnet", network: "mainnet", wantErr: true},
 		{name: "devnet", network: "devnet", wantErr: true},
 		{name: "invalid opt-in", network: "mainnet", optIn: "true", wantErr: true},
-		{name: "localnet", network: "localnet"},
+		{name: "localnet requires explicit opt-in", network: "localnet", wantErr: true},
+		{name: "localnet development opt-in", network: "localnet", optIn: "1"},
 		{name: "mainnet development opt-in", network: "mainnet", optIn: "1"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -697,7 +800,8 @@ func TestNewExplicitMemoryReplayStorePolicy(t *testing.T) {
 	}{
 		{name: "mainnet rejects memory store", network: "mainnet", wantErr: true},
 		{name: "devnet rejects memory store", network: "devnet", wantErr: true},
-		{name: "localnet permits memory store", network: "localnet"},
+		{name: "localnet rejects implicit memory store", network: "localnet", wantErr: true},
+		{name: "localnet opt-in permits memory store", network: "localnet", optIn: "1"},
 		{name: "mainnet opt-in permits memory store", network: "mainnet", optIn: "1"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -735,13 +839,14 @@ func TestChargeToken(t *testing.T) {
 	rpcClient := testutil.NewFakeRPC()
 	recipient := testutil.NewPrivateKey().PublicKey().String()
 	handler, err := New(Config{
-		Recipient: recipient,
-		Currency:  "USDC",
-		Decimals:  6,
-		Network:   "localnet",
-		SecretKey: "test-secret-key-0123456789abcdef",
-		RPC:       rpcClient,
-		Store:     core.NewMemoryStore(),
+		Recipient:              recipient,
+		Currency:               "USDC",
+		Decimals:               6,
+		Network:                "localnet",
+		SecretKey:              "test-secret-key-0123456789abcdef",
+		RPC:                    rpcClient,
+		Store:                  core.NewMemoryStore(),
+		AllowUnsafeMemoryStore: true,
 	})
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
@@ -898,13 +1003,14 @@ func TestVerifyCredentialGetTxFailure(t *testing.T) {
 	recipient := testutil.NewPrivateKey()
 	clientSigner := testutil.NewPrivateKey()
 	handler, err := New(Config{
-		Recipient: recipient.PublicKey().String(),
-		Currency:  "sol",
-		Decimals:  9,
-		Network:   "localnet",
-		SecretKey: "test-secret-key-0123456789abcdef",
-		RPC:       rpcClient,
-		Store:     core.NewMemoryStore(),
+		Recipient:              recipient.PublicKey().String(),
+		Currency:               "sol",
+		Decimals:               9,
+		Network:                "localnet",
+		SecretKey:              "test-secret-key-0123456789abcdef",
+		RPC:                    rpcClient,
+		Store:                  core.NewMemoryStore(),
+		AllowUnsafeMemoryStore: true,
 	})
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
@@ -943,14 +1049,15 @@ func TestChargeWithFeePayer(t *testing.T) {
 	feePayer := testutil.NewPrivateKey()
 	recipient := testutil.NewPrivateKey()
 	handler, err := New(Config{
-		Recipient:      recipient.PublicKey().String(),
-		Currency:       "sol",
-		Decimals:       9,
-		Network:        "localnet",
-		SecretKey:      "test-secret-key-0123456789abcdef",
-		RPC:            rpcClient,
-		Store:          core.NewMemoryStore(),
-		FeePayerSigner: feePayer,
+		Recipient:              recipient.PublicKey().String(),
+		Currency:               "sol",
+		Decimals:               9,
+		Network:                "localnet",
+		SecretKey:              "test-secret-key-0123456789abcdef",
+		RPC:                    rpcClient,
+		Store:                  core.NewMemoryStore(),
+		AllowUnsafeMemoryStore: true,
+		FeePayerSigner:         feePayer,
 	})
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
@@ -983,7 +1090,7 @@ func TestNewWithDefaultValues(t *testing.T) {
 		Recipient: recipient,
 		SecretKey: "test-secret-key-0123456789abcdef",
 		RPC:       rpcClient,
-		Store:     core.NewMemoryStore(),
+		Store:     &sharedTestStore{MemoryStore: core.NewMemoryStore()},
 	})
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
@@ -1019,7 +1126,7 @@ func TestChargeKnownStablecoinTokenPrograms(t *testing.T) {
 			Network:   "mainnet",
 			SecretKey: "test-secret-key-0123456789abcdef",
 			RPC:       rpcClient,
-			Store:     core.NewMemoryStore(),
+			Store:     &sharedTestStore{MemoryStore: core.NewMemoryStore()},
 		})
 		if err != nil {
 			t.Fatalf("new mpp failed: %v", err)
@@ -1049,13 +1156,14 @@ func TestVerifyCredentialTokenTransactionSuccess(t *testing.T) {
 	mint := testutil.NewPrivateKey().PublicKey()
 	rpcClient.MintOwners[mint.String()] = solana.TokenProgramID
 	handler, err := New(Config{
-		Recipient: recipient.PublicKey().String(),
-		Currency:  mint.String(),
-		Decimals:  6,
-		Network:   "localnet",
-		SecretKey: "test-secret-key-0123456789abcdef",
-		RPC:       rpcClient,
-		Store:     core.NewMemoryStore(),
+		Recipient:              recipient.PublicKey().String(),
+		Currency:               mint.String(),
+		Decimals:               6,
+		Network:                "localnet",
+		SecretKey:              "test-secret-key-0123456789abcdef",
+		RPC:                    rpcClient,
+		Store:                  core.NewMemoryStore(),
+		AllowUnsafeMemoryStore: true,
 	})
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
@@ -1105,7 +1213,7 @@ func TestRPCURL(t *testing.T) {
 		SecretKey: "test-secret-key-0123456789abcdef",
 		Network:   "devnet",
 		RPC:       rpcClient,
-		Store:     core.NewMemoryStore(),
+		Store:     &sharedTestStore{MemoryStore: core.NewMemoryStore()},
 	})
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
@@ -1121,14 +1229,15 @@ func TestVerifyCredentialTransactionWithFeePayerSigner(t *testing.T) {
 	feePayer := testutil.NewPrivateKey()
 	clientSigner := testutil.NewPrivateKey()
 	handler, err := New(Config{
-		Recipient:      recipient.PublicKey().String(),
-		Currency:       "sol",
-		Decimals:       9,
-		Network:        "localnet",
-		SecretKey:      "test-secret-key-0123456789abcdef",
-		RPC:            rpcClient,
-		Store:          core.NewMemoryStore(),
-		FeePayerSigner: feePayer,
+		Recipient:              recipient.PublicKey().String(),
+		Currency:               "sol",
+		Decimals:               9,
+		Network:                "localnet",
+		SecretKey:              "test-secret-key-0123456789abcdef",
+		RPC:                    rpcClient,
+		Store:                  core.NewMemoryStore(),
+		AllowUnsafeMemoryStore: true,
+		FeePayerSigner:         feePayer,
 	})
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
@@ -1162,14 +1271,15 @@ func TestVerifyCredentialRejectsTamperedTransferBeforeBroadcast(t *testing.T) {
 	feePayer := testutil.NewPrivateKey()
 	clientSigner := testutil.NewPrivateKey()
 	handler, err := New(Config{
-		Recipient:      recipient.PublicKey().String(),
-		Currency:       "sol",
-		Decimals:       9,
-		Network:        "localnet",
-		SecretKey:      "test-secret-key-0123456789abcdef",
-		RPC:            rpcClient,
-		Store:          core.NewMemoryStore(),
-		FeePayerSigner: feePayer,
+		Recipient:              recipient.PublicKey().String(),
+		Currency:               "sol",
+		Decimals:               9,
+		Network:                "localnet",
+		SecretKey:              "test-secret-key-0123456789abcdef",
+		RPC:                    rpcClient,
+		Store:                  core.NewMemoryStore(),
+		AllowUnsafeMemoryStore: true,
+		FeePayerSigner:         feePayer,
 	})
 	if err != nil {
 		t.Fatalf("new mpp failed: %v", err)
@@ -1662,7 +1772,7 @@ func TestVerifyTransactionSimulateError(t *testing.T) {
 		Network:   "localnet",
 		SecretKey: "test-secret-key-0123456789abcdef",
 		RPC:       wrapped,
-		Store:     core.NewMemoryStore(),
+		Store:     &sharedTestStore{MemoryStore: core.NewMemoryStore()},
 	})
 	if err != nil {
 		t.Fatalf("new: %v", err)
@@ -1697,13 +1807,14 @@ func TestVerifyTransactionSendError(t *testing.T) {
 	wrapped := &rpcSendErrRPC{FakeRPC: rpcClient}
 	recipient := testutil.NewPrivateKey()
 	handler, err := New(Config{
-		Recipient: recipient.PublicKey().String(),
-		Currency:  "sol",
-		Decimals:  9,
-		Network:   "localnet",
-		SecretKey: "test-secret-key-0123456789abcdef",
-		RPC:       wrapped,
-		Store:     core.NewMemoryStore(),
+		Recipient:              recipient.PublicKey().String(),
+		Currency:               "sol",
+		Decimals:               9,
+		Network:                "localnet",
+		SecretKey:              "test-secret-key-0123456789abcdef",
+		RPC:                    wrapped,
+		Store:                  core.NewMemoryStore(),
+		AllowUnsafeMemoryStore: true,
 	})
 	if err != nil {
 		t.Fatalf("new: %v", err)
@@ -1738,13 +1849,14 @@ func TestVerifyOnChainTransactionNotFound(t *testing.T) {
 	wrapped := &rpcGetTxErr{FakeRPC: rpcClient}
 	recipient := testutil.NewPrivateKey()
 	handler, err := New(Config{
-		Recipient: recipient.PublicKey().String(),
-		Currency:  "sol",
-		Decimals:  9,
-		Network:   "localnet",
-		SecretKey: "test-secret-key-0123456789abcdef",
-		RPC:       wrapped,
-		Store:     core.NewMemoryStore(),
+		Recipient:              recipient.PublicKey().String(),
+		Currency:               "sol",
+		Decimals:               9,
+		Network:                "localnet",
+		SecretKey:              "test-secret-key-0123456789abcdef",
+		RPC:                    wrapped,
+		Store:                  core.NewMemoryStore(),
+		AllowUnsafeMemoryStore: true,
 	})
 	if err != nil {
 		t.Fatalf("new: %v", err)
@@ -1768,6 +1880,8 @@ func TestVerifyOnChainTransactionNotFound(t *testing.T) {
 
 // errStore is a Store implementation that errors on PutIfAbsent.
 type errStore struct{}
+
+func (errStore) IsShared() bool { return true }
 
 func (errStore) PutIfAbsent(_ context.Context, _ string, _ any) (bool, error) {
 	return false, errors.New("store down")
@@ -1815,13 +1929,14 @@ func TestVerifyTransactionMissingPrimarySignature(t *testing.T) {
 	rpcClient := testutil.NewFakeRPC()
 	recipient := testutil.NewPrivateKey()
 	handler, err := New(Config{
-		Recipient: recipient.PublicKey().String(),
-		Currency:  "sol",
-		Decimals:  9,
-		Network:   "localnet",
-		SecretKey: "test-secret-key-0123456789abcdef",
-		RPC:       rpcClient,
-		Store:     core.NewMemoryStore(),
+		Recipient:              recipient.PublicKey().String(),
+		Currency:               "sol",
+		Decimals:               9,
+		Network:                "localnet",
+		SecretKey:              "test-secret-key-0123456789abcdef",
+		RPC:                    rpcClient,
+		Store:                  core.NewMemoryStore(),
+		AllowUnsafeMemoryStore: true,
 	})
 	if err != nil {
 		t.Fatalf("new: %v", err)
@@ -1859,7 +1974,7 @@ func TestVerifyTransactionWrongNetworkBlockhash(t *testing.T) {
 		Network:   "mainnet",
 		SecretKey: "test-secret-key-0123456789abcdef",
 		RPC:       rpcClient,
-		Store:     core.NewMemoryStore(),
+		Store:     &sharedTestStore{MemoryStore: core.NewMemoryStore()},
 	})
 	if err != nil {
 		t.Fatalf("new: %v", err)

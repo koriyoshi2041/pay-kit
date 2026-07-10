@@ -41,13 +41,14 @@ func decodeChallengeDetails(t *testing.T, challenge core.PaymentChallenge, out *
 func validConfig(t *testing.T) Config {
 	t.Helper()
 	return Config{
-		Recipient: testutil.NewPrivateKey().PublicKey().String(),
-		Currency:  "USDC",
-		Decimals:  6,
-		Network:   "localnet",
-		SecretKey: "test-secret-key-0123456789abcdef",
-		RPC:       testutil.NewFakeRPC(),
-		Store:     core.NewMemoryStore(),
+		Recipient:              testutil.NewPrivateKey().PublicKey().String(),
+		Currency:               "USDC",
+		Decimals:               6,
+		Network:                "localnet",
+		SecretKey:              "test-secret-key-0123456789abcdef",
+		RPC:                    testutil.NewFakeRPC(),
+		Store:                  core.NewMemoryStore(),
+		AllowUnsafeMemoryStore: true,
 	}
 }
 
@@ -76,6 +77,9 @@ func TestNewAcceptsCanonicalNetworks(t *testing.T) {
 	for _, network := range []string{"mainnet", "devnet", "localnet"} {
 		cfg := validConfig(t)
 		cfg.Network = network
+		if network != "localnet" {
+			cfg.Store = &sharedTestStore{MemoryStore: core.NewMemoryStore()}
+		}
 		// USDC resolves from the static table, no RPC fetch needed at boot.
 		if _, err := New(cfg); err != nil {
 			t.Fatalf("expected network %q to be accepted: %v", network, err)

@@ -6,6 +6,7 @@ namespace PayKit\Tests\Protocols\Mpp;
 
 use Nyholm\Psr7\Factory\Psr17Factory;
 use PayKit\Config;
+use PayKit\Exception\ConfigurationException;
 use PayKit\PayCore\Currency;
 use PayKit\Gate;
 use PayKit\PayCore\Network;
@@ -20,24 +21,47 @@ use PayKit\PayCore\Stablecoin;
 use PayKit\Store\MemoryStore;
 use PayKit\Store\ReplayStoreCapability;
 use PayKit\Store\Store;
+use PayKit\Store\DurableStore;
 use PHPUnit\Framework\TestCase;
+
+final class SharedAdapterReplayStore implements DurableStore
+{
+    /** @var array<string, mixed> */
+    private array $values = [];
+
+    public function isDurable(): bool
+    {
+        return true;
+    }
+
+    public function providesDurableSharedReplayProtection(): bool
+    {
+        return true;
+    }
+
+    public function putIfAbsent(string $key, mixed $value): bool
+    {
+        if (array_key_exists($key, $this->values)) {
+            return false;
+        }
+        $this->values[$key] = $value;
+        return true;
+    }
+}
 
 final class AdapterTest extends TestCase
 {
-    private function makeConfig(): Config
+    private function makeConfig(Network $network = Network::SolanaDevnet): Config
     {
         return new Config(
-            network: Network::SolanaDevnet,
+            network: $network,
             operator: new Operator(
                 recipient: Signer::generate()->pubkey(),
                 signer:    Signer::generate(),
                 feePayer:  true,
             ),
             preflight: false,
-            mpp: new MppConfig(
-                challengeBindingSecret: 'unit-test-secret-0123456789abcdef-01',
-                replayStore: new AdapterDurableSharedReplayStore(),
-            ),
+            mpp: new MppConfig(challengeBindingSecret: 'unit-test-secret-0123456789abcdef-01'),
         );
     }
 
@@ -49,8 +73,8 @@ final class AdapterTest extends TestCase
             mpp: new MppConfig(challengeBindingSecret: 'unit-test-secret-0123456789abcdef-01'),
         );
 
-        $this->expectException(\InvalidArgumentException::class);
-        $this->expectExceptionMessage('replayStore is required outside localnet');
+        $this->expectException(ConfigurationException::class);
+        $this->expectExceptionMessage('atomic durable/shared replay store');
 
         new Adapter($config);
     }
@@ -66,16 +90,76 @@ final class AdapterTest extends TestCase
             ),
         );
 
-        $this->expectException(\InvalidArgumentException::class);
-        $this->expectExceptionMessage('must explicitly declare durable shared replay protection');
+        $this->expectException(ConfigurationException::class);
+        $this->expectExceptionMessage('does not affirm durable/shared capability');
 
         new Adapter($config);
+    }
+
+    private function adapter(Config $config): Adapter
+    {
+        return new Adapter($config, new SharedAdapterReplayStore());
+    }
+
+    public function testNonLocalnetRequiresInjectedReplayStore(): void
+    {
+        $this->expectException(ConfigurationException::class);
+        $this->expectExceptionMessage('atomic durable/shared replay store');
+        new Adapter($this->makeConfig());
+    }
+
+    public function testNonLocalnetRejectsMemoryStore(): void
+    {
+        $this->expectException(ConfigurationException::class);
+        $this->expectExceptionMessage('does not affirm durable/shared capability');
+        new Adapter($this->makeConfig(), new MemoryStore());
+    }
+
+    public function testLocalnetStillRequiresExplicitUnsafeOptIn(): void
+    {
+        $this->expectException(ConfigurationException::class);
+        new Adapter($this->makeConfig(Network::SolanaLocalnet));
+    }
+
+    public function testExplicitUnsafeDevelopmentMemoryStoreIsAllowed(): void
+    {
+        $config = $this->makeConfig(Network::SolanaLocalnet);
+        $config = new Config(
+            network: $config->network,
+            operator: $config->operator,
+            preflight: false,
+            mpp: new MppConfig(
+                challengeBindingSecret: 'unit-test-secret-0123456789abcdef-01',
+                allowUnsafeMemoryStore: true,
+            ),
+        );
+        $adapter = new Adapter($config);
+        self::assertInstanceOf(Adapter::class, $adapter);
+    }
+
+    public function testNonLocalnetAllowsInjectedStore(): void
+    {
+        self::assertInstanceOf(Adapter::class, $this->adapter($this->makeConfig()));
+    }
+
+    public function testNonLocalnetUsesStoreFromMppConfig(): void
+    {
+        $config = new Config(
+            network: Network::SolanaDevnet,
+            operator: new Operator(signer: Signer::generate()),
+            preflight: false,
+            mpp: new MppConfig(
+                challengeBindingSecret: 'unit-test-secret-0123456789abcdef-01',
+                replayStore: new SharedAdapterReplayStore(),
+            ),
+        );
+        self::assertInstanceOf(Adapter::class, new Adapter($config));
     }
 
     public function testAcceptsEntryShape(): void
     {
         $cfg = $this->makeConfig();
-        $adapter = new Adapter($cfg);
+        $adapter = $this->adapter($cfg);
         $gate = new Gate(amount: Price::usd('0.10'));
         $req = (new Psr17Factory())->createServerRequest('GET', '/paid');
         $entry = $adapter->acceptsEntry($gate, $req);
@@ -89,7 +173,7 @@ final class AdapterTest extends TestCase
     public function testAcceptsEntryIncludesSplitsForFeeBearingGate(): void
     {
         $cfg = $this->makeConfig();
-        $adapter = new Adapter($cfg);
+        $adapter = $this->adapter($cfg);
         $platform = Signer::generate()->pubkey();
         $gate = new Gate(
             amount: Price::usd('10.00'),
@@ -111,7 +195,7 @@ final class AdapterTest extends TestCase
         // share as amount - sum(splits), so the merchant was undercharged the
         // fee. The expected (and issued) charge request must use gate->total().
         $cfg = $this->makeConfig();
-        $adapter = new Adapter($cfg);
+        $adapter = $this->adapter($cfg);
         $platform = Signer::generate()->pubkey();
         $gate = new Gate(
             amount: Price::usd('10.00'),
@@ -135,7 +219,7 @@ final class AdapterTest extends TestCase
     {
         // fee-within gates keep total == base, so the total switch is a no-op.
         $cfg = $this->makeConfig();
-        $adapter = new Adapter($cfg);
+        $adapter = $this->adapter($cfg);
         $platform = Signer::generate()->pubkey();
         $gate = new Gate(
             amount: Price::usd('10.00'),
@@ -152,7 +236,7 @@ final class AdapterTest extends TestCase
     public function testChallengeHeadersHaveWwwAuthenticate(): void
     {
         $cfg = $this->makeConfig();
-        $adapter = new Adapter($cfg);
+        $adapter = $this->adapter($cfg);
         $gate = new Gate(amount: Price::usd('0.10'));
         $req = (new Psr17Factory())->createServerRequest('GET', '/paid');
         $headers = $adapter->challengeHeaders($gate, $req);
@@ -163,7 +247,7 @@ final class AdapterTest extends TestCase
     public function testVerifyAndSettleWithoutAuthorizationRaises(): void
     {
         $cfg = $this->makeConfig();
-        $adapter = new Adapter($cfg);
+        $adapter = $this->adapter($cfg);
         $gate = new Gate(amount: Price::usd('0.10'));
         $req = (new Psr17Factory())->createServerRequest('GET', '/paid');
         $this->expectException(\PayKit\Exception\InvalidProofException::class);
@@ -189,7 +273,7 @@ final class AdapterTest extends TestCase
     public function testAdapterPathIssuesValidChallengeForOnRouteRequest(): void
     {
         $cfg = $this->makeConfig();
-        $adapter = new Adapter($cfg);
+        $adapter = $this->adapter($cfg);
         $gate = new Gate(amount: Price::usd('0.10'));
 
         // The on-route request built by the adapter must pass the (now-active)
@@ -205,7 +289,7 @@ final class AdapterTest extends TestCase
     public function testAdapterPathRejectsMismatchedCurrencyAtIssuance(): void
     {
         $cfg = $this->makeConfig();
-        $adapter = new Adapter($cfg);
+        $adapter = $this->adapter($cfg);
         $gate = new Gate(amount: Price::usd('0.10'));
         $charges = $this->serverFor($adapter, $gate);
 
@@ -222,7 +306,7 @@ final class AdapterTest extends TestCase
     public function testAdapterPathRejectsMismatchedRecipientAtIssuance(): void
     {
         $cfg = $this->makeConfig();
-        $adapter = new Adapter($cfg);
+        $adapter = $this->adapter($cfg);
         $gate = new Gate(amount: Price::usd('0.10'));
         $charges = $this->serverFor($adapter, $gate);
 
@@ -239,7 +323,7 @@ final class AdapterTest extends TestCase
     public function testAdapterPathRejectsMismatchedNetworkAtIssuance(): void
     {
         $cfg = $this->makeConfig();
-        $adapter = new Adapter($cfg);
+        $adapter = $this->adapter($cfg);
         $gate = new Gate(amount: Price::usd('0.10'));
         $charges = $this->serverFor($adapter, $gate);
 
@@ -267,7 +351,7 @@ final class AdapterTest extends TestCase
             mpp: new MppConfig(
                 challengeBindingSecret: 'unit-test-secret-0123456789abcdef-01',
                 expiresIn: $expiresIn,
-                replayStore: new AdapterDurableSharedReplayStore(),
+                replayStore: new SharedAdapterReplayStore(),
             ),
         );
     }
@@ -278,7 +362,7 @@ final class AdapterTest extends TestCase
         // issued challenge as an RFC 3339 expires. Previously the adapter
         // issued challenges with no expiry, so they never expired.
         $cfg = $this->makeConfigWithExpiresIn(120);
-        $adapter = new Adapter($cfg);
+        $adapter = $this->adapter($cfg);
         $gate = new Gate(amount: Price::usd('0.10'));
         $req = (new Psr17Factory())->createServerRequest('GET', '/paid');
 
@@ -302,7 +386,7 @@ final class AdapterTest extends TestCase
         // The wired expiry must actually drive isExpired(): a challenge
         // issued with a short TTL is expired once that window elapses.
         $cfg = $this->makeConfigWithExpiresIn(1);
-        $adapter = new Adapter($cfg);
+        $adapter = $this->adapter($cfg);
         $gate = new Gate(amount: Price::usd('0.10'));
         $req = (new Psr17Factory())->createServerRequest('GET', '/paid');
 
@@ -318,7 +402,7 @@ final class AdapterTest extends TestCase
         // expiresIn = 0 is the documented dev-only opt-out: the challenge
         // is issued with no expires and never expires.
         $cfg = $this->makeConfigWithExpiresIn(0);
-        $adapter = new Adapter($cfg);
+        $adapter = $this->adapter($cfg);
         $gate = new Gate(amount: Price::usd('0.10'));
         $req = (new Psr17Factory())->createServerRequest('GET', '/paid');
 
@@ -328,25 +412,5 @@ final class AdapterTest extends TestCase
         $this->assertSame('', $challenge->expires, 'expiresIn=0 must issue an empty (never-expires) challenge');
         $farFuture = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->add(new \DateInterval('P3650D'));
         $this->assertFalse($challenge->isExpired($farFuture));
-    }
-}
-
-final class AdapterDurableSharedReplayStore implements Store, ReplayStoreCapability
-{
-    private MemoryStore $store;
-
-    public function __construct()
-    {
-        $this->store = new MemoryStore();
-    }
-
-    public function putIfAbsent(string $key, mixed $value): bool
-    {
-        return $this->store->putIfAbsent($key, $value);
-    }
-
-    public function providesDurableSharedReplayProtection(): bool
-    {
-        return true;
     }
 }

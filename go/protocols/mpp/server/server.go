@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/bits"
 	"os"
 	"strings"
@@ -71,12 +72,15 @@ type Config struct {
 	Realm          string
 	HTML           bool
 	FeePayerSigner solanatx.Signer
-	// Store holds replay markers. Outside localnet it must be shared and
-	// durable: an absent store or *core.MemoryStore is rejected unless
-	// PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1 explicitly permits a
-	// process-local development store.
+	// Store persists consumed charge credentials. Construction requires an
+	// implementation that affirmatively implements SharedStore on every network
+	// unless an explicit development-only unsafe opt-in is enabled.
 	Store core.Store
 	RPC   solanatx.RPCClient
+	// AllowUnsafeMemoryStore is an explicit development/test escape hatch.
+	// It permits a process-local store on any network and defaults to false.
+	// Never enable it in a multi-instance deployment.
+	AllowUnsafeMemoryStore bool
 
 	// AcceptPushMode opts in to accepting type="signature" (push mode)
 	// credentials, where the client broadcasts the transaction itself and
@@ -160,21 +164,19 @@ func New(config Config) (*Mpp, error) {
 		return nil, core.WrapError(core.ErrCodeInvalidConfig, "invalid network", err)
 	}
 	config.Network = string(canonicalNetwork)
-	usesMemoryReplayStore := false
-	if config.Store != nil {
-		_, usesMemoryReplayStore = config.Store.(*core.MemoryStore)
-	}
-	if canonicalNetwork != paycore.NetworkLocalnet && (config.Store == nil || usesMemoryReplayStore) && os.Getenv(allowInMemoryReplayStoreEnvVar) != "1" {
-		storeDescription := "no replay store"
-		if usesMemoryReplayStore {
-			storeDescription = "process-local *core.MemoryStore"
-		}
-		return nil, core.NewError(core.ErrCodeInvalidConfig,
-			fmt.Sprintf("%s configured for %s; configure a shared replay Store or set %s=1 to allow a process-local development store",
-				storeDescription, config.Network, allowInMemoryReplayStoreEnvVar))
+	allowUnsafeMemoryStore := config.AllowUnsafeMemoryStore || os.Getenv(allowInMemoryReplayStoreEnvVar) == "1"
+	if config.Store == nil && allowUnsafeMemoryStore {
+		log.Printf("pay-kit: WARNING: MPP server on %s explicitly enabled process-local MemoryStore; replay markers are lost on restart and are not shared across workers", config.Network)
+		config.Store = core.NewMemoryStore()
 	}
 	if config.Store == nil {
-		config.Store = core.NewMemoryStore()
+		return nil, core.NewError(core.ErrCodeInvalidConfig,
+			fmt.Sprintf("an atomic shared replay store is required on %s; inject Config.Store, enable AllowUnsafeMemoryStore, or set %s=1 for development", config.Network, allowInMemoryReplayStoreEnvVar))
+	}
+	shared, sharedOK := config.Store.(core.SharedStore)
+	if (!sharedOK || !shared.IsShared()) && !allowUnsafeMemoryStore {
+		return nil, core.NewError(core.ErrCodeInvalidConfig,
+			fmt.Sprintf("an atomic shared replay store is required on %s; Store must implement SharedStore and report IsShared() == true, or explicitly opt into an unsafe development store with AllowUnsafeMemoryStore or %s=1", config.Network, allowInMemoryReplayStoreEnvVar))
 	}
 	// Derive a per-recipient default realm when none is configured (and reject
 	// an explicitly-empty realm). A shared literal default would let two

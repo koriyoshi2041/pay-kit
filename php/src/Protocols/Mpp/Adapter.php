@@ -5,10 +5,10 @@ declare(strict_types=1);
 namespace PayKit\Protocols\Mpp;
 
 use PayKit\Config;
+use PayKit\Exception\ConfigurationException;
 use PayKit\Exception\InvalidProofException;
 use PayKit\Gate;
 use PayKit\Payment;
-use PayKit\PayCore\Network;
 use PayKit\Price;
 use PayKit\Protocol;
 use PayKit\Protocols\Mpp\Intent\ChargeRequest;
@@ -17,8 +17,8 @@ use PayKit\Protocols\Mpp\Server\ChargeSettlement;
 use PayKit\Protocols\Mpp\Server\PaymentRequiredResponse;
 use PayKit\Protocols\Mpp\Server\SolanaChargeHandler;
 use PayKit\Store\MemoryStore;
-use PayKit\Store\ReplayStoreCapability;
 use PayKit\Store\Store;
+use PayKit\Store\DurableStore;
 use Psr\Http\Message\ServerRequestInterface;
 use SolanaPhpSdk\Keypair\Keypair;
 use SolanaPhpSdk\Rpc\RpcClient;
@@ -42,38 +42,36 @@ final class Adapter
 
     /**
      * @param ?Store $replayStore Replay-protection store shared across every
-     *        {@see SolanaChargeHandler} this adapter builds. When null, the
-     *        MPP config's replayStore is used. Localnet may fall back to an
-     *        in-process {@see MemoryStore}; every other network requires a
-     *        store that explicitly declares durable shared replay protection.
+     *        {@see SolanaChargeHandler} this adapter builds. Null uses the MPP
+     *        config's store; process-local memory requires the explicit unsafe
+     *        development opt-in. Otherwise a store must affirm atomic, durable,
+     *        cross-worker replay protection.
      */
     public function __construct(
         private readonly Config $config,
         ?Store $replayStore = null,
     ) {
         $replayStore ??= $config->mpp->replayStore;
-        if ($replayStore === null) {
-            if ($config->network !== Network::SolanaLocalnet) {
-                throw new \InvalidArgumentException(
-                    'pay_kit: MPP replayStore is required outside localnet; '
-                    . 'inject a durable shared Store (for example Redis or Postgres)',
-                );
-            }
+        if ($replayStore === null && $config->mpp->allowUnsafeMemoryStore) {
             if (function_exists('error_log')) {
                 error_log(
-                    'pay_kit: WARN: mpp adapter using in-memory replay store; '
-                    . 'allowed only on localnet.',
+                    'pay_kit: WARN: MPP explicitly enabled a process-local replay store; '
+                    . 'markers are lost on restart and are not shared across workers.',
                 );
             }
             $replayStore = new MemoryStore();
         }
-        if (
-            $config->network !== Network::SolanaLocalnet
-            && (!$replayStore instanceof ReplayStoreCapability
-                || !$replayStore->providesDurableSharedReplayProtection())
-        ) {
-            throw new \InvalidArgumentException(
-                'pay_kit: MPP replayStore must explicitly declare durable shared replay protection outside localnet',
+        if ($replayStore === null) {
+            throw new ConfigurationException(
+                'pay_kit: MPP requires an injected atomic durable/shared replay store; '
+                . 'allowUnsafeMemoryStore is development-only',
+            );
+        }
+        if (!$config->mpp->allowUnsafeMemoryStore
+            && (!$replayStore instanceof DurableStore || !$replayStore->isDurable())) {
+            throw new ConfigurationException(
+                'pay_kit: MPP replay store does not affirm durable/shared capability; '
+                . 'implement DurableStore::isDurable() and return true',
             );
         }
         $this->replayStore = $replayStore;
@@ -248,6 +246,7 @@ final class Adapter
             network: $this->config->network->mintsLabel(),
             replayStore: $this->replayStore,
             acceptPushMode: $this->config->mpp->acceptPushMode,
+            allowUnsafeMemoryStore: $this->config->mpp->allowUnsafeMemoryStore,
         );
         $this->handlerCache[$key] = [$charges, $handler];
         return $this->handlerCache[$key];

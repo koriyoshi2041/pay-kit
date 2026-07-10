@@ -19,6 +19,7 @@ use PayKit\Protocol;
 use PayKit\Protocols\Mpp\MppConfig;
 use PayKit\Signer;
 use PayKit\Store\MemoryStore;
+use PayKit\Store\DurableStore;
 use PayKit\Store\ReplayStoreCapability;
 use PayKit\Store\Store;
 use PHPUnit\Framework\TestCase;
@@ -30,6 +31,18 @@ final class RequirePaymentTest extends TestCase
 {
     private PayKit $client;
     private Psr17Factory $factory;
+
+    public function testX402OnlyConstructionDoesNotRequireMppReplayStore(): void
+    {
+        $client = new PayKit(new Config(
+            network: Network::SolanaDevnet,
+            accept: [Protocol::X402],
+            operator: new Operator(recipient: Signer::generate()->pubkey(), signer: Signer::generate()),
+            preflight: false,
+        ));
+        $middleware = new RequirePayment($client, new Gate(amount: Price::usd('0.10')));
+        self::assertInstanceOf(RequirePayment::class, $middleware);
+    }
 
     protected function setUp(): void
     {
@@ -182,7 +195,7 @@ final class RequirePaymentTest extends TestCase
     }
 }
 
-final class MiddlewareDurableSharedReplayStore implements Store, ReplayStoreCapability
+final class MiddlewareDurableSharedReplayStore implements Store, ReplayStoreCapability, DurableStore
 {
     private MemoryStore $store;
 
@@ -197,6 +210,11 @@ final class MiddlewareDurableSharedReplayStore implements Store, ReplayStoreCapa
     }
 
     public function providesDurableSharedReplayProtection(): bool
+    {
+        return true;
+    }
+
+    public function isDurable(): bool
     {
         return true;
     }

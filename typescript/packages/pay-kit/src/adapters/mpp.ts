@@ -6,10 +6,11 @@ import type { ProtocolAdapter } from '../adapter.js';
 import type { AcceptsEntry } from '../challenge.js';
 import { requireMint, resolveCoin } from '../coin.js';
 import type { PayKitConfig } from '../config.js';
-import { InvalidProofError } from '../errors.js';
+import { ConfigurationError, InvalidProofError } from '../errors.js';
 import type { Gate } from '../gate.js';
 import type { Payment } from '../payment.js';
 import { caip2, toSolanaNetwork } from '../protocol.js';
+import { atomicReplayStoreView, isAtomicReplayStore, isProductionReplayStore } from '../replay-store.js';
 
 /** Settlement header mirrored by every PayKit SDK. */
 const SETTLEMENT_SIGNATURE_HEADER = 'x-payment-settlement-signature';
@@ -49,6 +50,16 @@ function schemeFor(gate: Gate): 'charge' | 'subscription' {
  * distinct (recipient, splits) shape and cached.
  */
 export function createMppAdapter(config: PayKitConfig): ProtocolAdapter {
+    if (config.replayStore === undefined) {
+        throw new ConfigurationError('MPP adapter requires the replayStore resolved by configure().');
+    }
+    if (!isAtomicReplayStore(config.replayStore)) {
+        throw new ConfigurationError('MPP adapter replayStore must implement atomic putIfAbsent(key, value).');
+    }
+    if (!config.mpp.allowUnsafeMemoryStore && !isProductionReplayStore(config.replayStore)) {
+        throw new ConfigurationError('MPP adapter replayStore must affirmatively set isShared=true or isDurable=true.');
+    }
+    const replayStore = atomicReplayStoreView(config.replayStore);
     const network = toSolanaNetwork(config.network);
     const handlers = new Map<string, ChargeHandler>();
 
@@ -85,6 +96,7 @@ export function createMppAdapter(config: PayKitConfig): ProtocolAdapter {
                             puller,
                             recipient: gate.payTo,
                             rpcUrl: config.rpcUrl,
+                            store: replayStore,
                             tokenProgram: TOKEN_PROGRAM,
                             ...signer,
                         }),
@@ -111,7 +123,7 @@ export function createMppAdapter(config: PayKitConfig): ProtocolAdapter {
                             rpcUrl: config.rpcUrl,
                             ...signer,
                             ...(splits.length > 0 ? { splits: [...splits] } : {}),
-                            ...(config.replayStore ? { store: config.replayStore } : {}),
+                            store: replayStore,
                         }),
                     ],
                     realm: config.mpp.realm,

@@ -29,6 +29,7 @@ from pydantic import Strict
 from solana_pay_kit._paycore.network import Network
 from solana_pay_kit._paycore.protocol import Protocol
 from solana_pay_kit._paycore.stablecoin import Stablecoin
+from solana_pay_kit._paycore.store import Store
 from solana_pay_kit.errors import ConfigurationError, DemoSignerOnMainnetError
 from solana_pay_kit.operator import Operator
 from solana_pay_kit.price import Price
@@ -112,10 +113,16 @@ class X402Config(pydantic.BaseModel):
 class MppConfig(pydantic.BaseModel):
     """MPP-protocol knobs: realm label, challenge-binding secret, expiry window."""
 
-    model_config = pydantic.ConfigDict(frozen=True, extra="forbid")
+    model_config = pydantic.ConfigDict(frozen=True, arbitrary_types_allowed=True, extra="forbid")
 
     realm: str = "App"
     challenge_binding_secret: str | None = None
+    # Required outside localnet. Kept in MppConfig so framework shims that
+    # auto-construct MppAdapter can receive the operator's shared store.
+    replay_store: Store | None = None
+    # Selecting localnet alone never weakens replay protection. This separate
+    # flag is the only opt-in to a process-local development store.
+    allow_unsafe_memory_store: bool = False
     # Strict: reject bool (an int subclass) and float coercion; an expiry window
     # must be a real int. Existing valid int inputs are unaffected.
     expires_in: Annotated[int, Strict()] = 120
@@ -278,9 +285,7 @@ def _apply_pay_config_env(
     preflight_raw = environ.get(f"{env_prefix}PREFLIGHT")
     no_preflight_raw = environ.get(f"{env_prefix}NO_PREFLIGHT")
     if preflight_raw is not None and no_preflight_raw is not None:
-        raise ConfigurationError(
-            f"solana_pay_kit: set only one of {env_prefix}PREFLIGHT or {env_prefix}NO_PREFLIGHT"
-        )
+        raise ConfigurationError(f"solana_pay_kit: set only one of {env_prefix}PREFLIGHT or {env_prefix}NO_PREFLIGHT")
 
     if preflight_raw is not None:
         values["preflight"] = _parse_bool_env(f"{env_prefix}PREFLIGHT", preflight_raw)

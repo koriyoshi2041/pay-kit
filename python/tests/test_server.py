@@ -983,6 +983,8 @@ class TestL8SettlementOrdering:
             return FakeResponse(self.tx)
 
     class _RecordingStore:
+        is_shared = True
+
         def __init__(self, ordering: list[str]):
             self._ordering = ordering
             self._data: dict = {}

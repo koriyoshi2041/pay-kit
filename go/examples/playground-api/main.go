@@ -201,6 +201,7 @@ func newPaymentClient(a *app, accept []paykit.Protocol, x402Scheme string) (*pay
 		MPP: paykit.MPPConfig{
 			Realm:                  "PayKit Playground",
 			ChallengeBindingSecret: []byte(a.secretKey),
+			AllowUnsafeMemoryStore: network == paykit.SolanaLocalnet,
 		},
 		X402: paykit.X402Config{
 			Scheme: x402Scheme,

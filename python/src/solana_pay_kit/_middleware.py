@@ -84,38 +84,53 @@ _X402_STORE_CACHE: weakref.WeakKeyDictionary[Config, Store] = weakref.WeakKeyDic
 X402ReplayStoreFactory = Callable[["Config"], object]
 
 
-def _replay_stores(
+def _mpp_replay_store(config: Config, replay_store: Store | None) -> Store | None:
+    if Protocol.MPP not in config.accept:
+        return None
+    if replay_store is not None:
+        _MPP_STORE_CACHE[config] = replay_store
+        return replay_store
+
+    cached = _MPP_STORE_CACHE.get(config)
+    if cached is not None:
+        return cached
+    if config.mpp.replay_store is not None:
+        _MPP_STORE_CACHE[config] = config.mpp.replay_store
+        return config.mpp.replay_store
+    if config.mpp.allow_unsafe_memory_store:
+        store = MemoryStore()
+        _MPP_STORE_CACHE[config] = store
+        return store
+    return None
+
+
+def _x402_replay_store(
     config: Config,
     x402_replay_store: Store | None,
     x402_replay_store_factory: X402ReplayStoreFactory | None,
-) -> tuple[Store, Store | None]:
+) -> Store | None:
     if x402_replay_store is not None and x402_replay_store_factory is not None:
         raise ConfigurationError("pass x402_replay_store or x402_replay_store_factory, not both")
 
-    mpp_store = _MPP_STORE_CACHE.get(config)
-    if mpp_store is None:
-        mpp_store = MemoryStore()
-        _MPP_STORE_CACHE[config] = mpp_store
-
     if Protocol.X402 not in config.accept:
-        return mpp_store, None
+        return None
 
     if x402_replay_store is not None:
         _X402_STORE_CACHE[config] = x402_replay_store
-        return mpp_store, x402_replay_store
+        return x402_replay_store
 
     cached = _X402_STORE_CACHE.get(config)
     if cached is not None:
-        return mpp_store, cached
+        return cached
 
     if x402_replay_store_factory is not None:
         built = x402_replay_store_factory(config)
         if not isinstance(built, Store):
             raise ConfigurationError("x402_replay_store_factory must return an atomic Store")
         _X402_STORE_CACHE[config] = built
-        return mpp_store, built
+        return built
 
-    return mpp_store, None
+    return None
 
 
 def reset_core_cache() -> None:
@@ -139,17 +154,22 @@ class PayCore:
         config: Config,
         *,
         mpp: MppAdapter | None = None,
+        mpp_replay_store: Store | None = None,
         x402: X402Adapter | None = None,
         x402_replay_store: Store | None = None,
         x402_replay_store_factory: X402ReplayStoreFactory | None = None,
     ) -> None:
         """Bind to ``config`` and resolve (or inject) the scheme adapters."""
-        mpp_store, resolved_x402_store = _replay_stores(
-            config, x402_replay_store, x402_replay_store_factory
-        )
+        resolved_mpp_store = _mpp_replay_store(config, mpp_replay_store)
+        resolved_x402_store = _x402_replay_store(config, x402_replay_store, x402_replay_store_factory)
         self._config = config
-        self._mpp = mpp if mpp is not None else MppAdapter(config, replay_store=mpp_store)
-        self._x402_replay_store = resolved_x402_store
+        if mpp is not None:
+            self._mpp: MppAdapter | None = mpp
+        elif Protocol.MPP in config.accept:
+            self._mpp = MppAdapter(config, replay_store=resolved_mpp_store)
+        else:
+            self._mpp = None
+        self._mpp_replay_store = self._mpp.replay_store if self._mpp is not None else None
         # Auto-wire the x402 adapter only when the config accept list includes
         # it; mirrors the PHP constructor. An explicit adapter always wins.
         if x402 is not None:
@@ -158,12 +178,14 @@ class PayCore:
             self._x402 = X402Adapter(config, replay_store=resolved_x402_store)
         else:
             self._x402 = None
+        self._x402_replay_store = resolved_x402_store
 
     @classmethod
     def for_config(
         cls,
         config: Config,
         *,
+        mpp_replay_store: Store | None = None,
         x402_replay_store: Store | None = None,
         x402_replay_store_factory: X402ReplayStoreFactory | None = None,
     ) -> PayCore:
@@ -175,14 +197,21 @@ class PayCore:
         cannot be replayed. A fresh ``PayCore(config)`` per request (the prior
         behaviour) reset that store on every call.
         """
-        _, resolved_x402_store = _replay_stores(
-            config, x402_replay_store, x402_replay_store_factory
-        )
+        resolved_mpp_store = _mpp_replay_store(config, mpp_replay_store)
+        resolved_x402_store = _x402_replay_store(config, x402_replay_store, x402_replay_store_factory)
         cached_ref = _CORE_CACHE.get(config)
         cached = cached_ref() if cached_ref is not None else None
-        if cached is not None and cached._x402_replay_store is resolved_x402_store:
+        if cached is not None:
+            if resolved_mpp_store is not cached._mpp_replay_store:
+                raise RuntimeError("PayCore.for_config received a different MPP replay store for a cached Config")
+            if resolved_x402_store is not None and resolved_x402_store is not cached._x402_replay_store:
+                raise RuntimeError("PayCore.for_config received a different x402 replay store for a cached Config")
             return cached
-        core = cls(config, x402_replay_store=resolved_x402_store)
+        core = cls(
+            config,
+            mpp_replay_store=resolved_mpp_store,
+            x402_replay_store=resolved_x402_store,
+        )
         _CORE_CACHE[config] = weakref.ref(core)
         return core
 
@@ -278,7 +307,7 @@ class PayCore:
         if self._x402 is not None and Protocol.X402 in accept and not gate.has_fees():
             accepts.append(self._x402.accepts_entry(gate, request))
             headers.update(self._x402.challenge_headers(gate, request))
-        if Protocol.MPP in accept:
+        if Protocol.MPP in accept and self._mpp is not None:
             accepts.append(self._mpp.accepts_entry(gate, request))
             headers.update(self._mpp.challenge_headers(gate, request))
 

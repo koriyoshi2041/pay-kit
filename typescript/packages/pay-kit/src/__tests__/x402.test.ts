@@ -34,7 +34,7 @@ import { usd } from '../price.js';
 import { gateDefaults } from '../pricing.js';
 
 async function testConfig(): Promise<PayKitConfig> {
-    return await configure({ mpp: { challengeBindingSecret: 'x402-test-secret' }, network: 'solana_localnet' });
+    return await configure({ accept: ['x402'], network: 'solana_localnet' });
 }
 
 function gateFor(config: PayKitConfig, amount = usd('0.10')): Gate {

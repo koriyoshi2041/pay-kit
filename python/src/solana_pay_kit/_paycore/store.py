@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import json
 import os
 import tempfile
@@ -32,6 +33,8 @@ from typing import Any, Protocol, runtime_checkable
 @runtime_checkable
 class Store(Protocol):
     """Async key-value store interface."""
+
+    is_shared: bool
 
     async def get(self, key: str) -> Any | None: ...
     async def put(self, key: str, value: Any) -> None: ...
@@ -45,6 +48,8 @@ class MemoryStore:
     State lives in this process only. A restart drops every consumed-signature
     record, which is fine for single-process tests but unsafe in production.
     """
+
+    is_shared = False
 
     def __init__(self) -> None:
         self._data: dict[str, Any] = {}
@@ -83,10 +88,24 @@ class FileReplayStore:
     either, plug in your own :class:`Store` (e.g. a Redis-backed one).
     """
 
+    is_shared = True
+
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self._path = Path(path)
+        self._lock_path = self._path.with_name(self._path.name + ".lock")
         self._lock = asyncio.Lock()
         self._data: dict[str, Any] = self._load()
+
+    @contextlib.contextmanager
+    def _file_lock(self, *, exclusive: bool):
+        """Lock all live FileReplayStore instances sharing this path."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self._lock_path, "a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _load(self) -> dict[str, Any]:
         try:
@@ -144,20 +163,21 @@ class FileReplayStore:
                 os.unlink(tmp.name)
             raise
 
+    def _get_locked(self, key: str) -> Any | None:
+        with self._file_lock(exclusive=False):
+            current = self._load()
+            self._data = current
+            return current.get(key)
+
     async def get(self, key: str) -> Any | None:
-        return self._data.get(key)
+        async with self._lock:
+            return await asyncio.to_thread(self._get_locked, key)
 
-    async def _flush_off_loop(self, data: dict[str, Any]) -> None:
-        """Run the blocking ``_flush`` in a worker thread.
-
-        ``_flush`` performs synchronous file IO and ``os.fsync()``; both
-        block the event loop if called directly from an async coroutine
-        and degrade tail latency for the whole server under load.
-        ``asyncio.to_thread`` offloads the call to the default executor
-        so other coroutines stay responsive while the page-cache
-        flushes to disk.
-        """
-        await asyncio.to_thread(self._flush, data)
+    def _put_locked(self, key: str, value: Any) -> None:
+        with self._file_lock(exclusive=True):
+            next_data = {**self._load(), key: value}
+            self._flush(next_data)
+            self._data = next_data
 
     async def put(self, key: str, value: Any) -> None:
         # Greptile P1 (follow-up): flush BEFORE committing to
@@ -167,23 +187,33 @@ class FileReplayStore:
         # ``get`` would report a key that was never durably persisted.
         # We build the next dict, flush it, then swap.
         async with self._lock:
-            next_data = {**self._data, key: value}
-            await self._flush_off_loop(next_data)
+            await asyncio.to_thread(self._put_locked, key, value)
+
+    def _delete_locked(self, key: str) -> None:
+        with self._file_lock(exclusive=True):
+            current = self._load()
+            if key not in current:
+                self._data = current
+                return
+            next_data = {k: v for k, v in current.items() if k != key}
+            self._flush(next_data)
             self._data = next_data
 
     async def delete(self, key: str) -> None:
         async with self._lock:
-            if key not in self._data:
-                return
-            next_data = {k: v for k, v in self._data.items() if k != key}
-            await self._flush_off_loop(next_data)
+            await asyncio.to_thread(self._delete_locked, key)
+
+    def _put_if_absent_locked(self, key: str, value: Any) -> bool:
+        with self._file_lock(exclusive=True):
+            current = self._load()
+            if key in current:
+                self._data = current
+                return False
+            next_data = {**current, key: value}
+            self._flush(next_data)
             self._data = next_data
+            return True
 
     async def put_if_absent(self, key: str, value: Any) -> bool:
         async with self._lock:
-            if key in self._data:
-                return False
-            next_data = {**self._data, key: value}
-            await self._flush_off_loop(next_data)
-            self._data = next_data
-            return True
+            return await asyncio.to_thread(self._put_if_absent_locked, key, value)
