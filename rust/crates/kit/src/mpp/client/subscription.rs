@@ -879,7 +879,7 @@ mod tests {
             &*signer,
             &rpc,
             md,
-            pinned_options(BuildSubscriptionActivationOptions::default()),
+            test_options(),
         )
         .await
     }
