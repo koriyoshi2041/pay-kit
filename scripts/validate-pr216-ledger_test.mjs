@@ -13,8 +13,22 @@ const ledger = JSON.parse(
   readFileSync(resolve(repoRoot, ".github/delivery/pr216-ledger.json"), "utf8"),
 );
 const inventory = getSourceInventory();
+const ciWorkflow = readFileSync(
+  resolve(repoRoot, ".github/workflows/ci.yml"),
+  "utf8",
+);
 
 validateLedger(ledger, inventory);
+
+const lintJob = ciWorkflow.match(
+  /\n  lint:\n([\s\S]*?)(?=\n  [a-z][a-z0-9-]*:\n)/,
+)?.[1];
+assert.ok(lintJob, "ci.yml must define the lint job");
+assert.match(
+  lintJob,
+  /actions\/checkout@[a-f0-9]+[^\n]*\n\s+with:\n(?:\s+#[^\n]*\n)*\s+fetch-depth: 0\n/,
+  "the ledger gate needs full Git history in the lint job",
+);
 
 function expectFailure(name, mutate, pattern) {
   const candidate = structuredClone(ledger);
