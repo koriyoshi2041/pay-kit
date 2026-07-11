@@ -703,6 +703,8 @@ func TestNewTopUpTxVerifierRejectsUnrelatedOrMismatchedTransaction(t *testing.T)
 			t.Fatalf("err = %v, want delta-mismatch rejection", err)
 		}
 	})
+}
+
 func TestNewTopUpTxVerifierRejectsTwoMatchingInstructions(t *testing.T) {
 	payer := testutil.NewPrivateKey()
 	channelID := solana.NewWallet().PublicKey()
