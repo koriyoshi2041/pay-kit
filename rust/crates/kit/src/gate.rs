@@ -131,6 +131,7 @@ impl Default for PayKitConfig {
 /// route on either protocol. Cheap to clone (two `Arc`s).
 #[derive(Clone)]
 pub struct PayKit {
+    accepted_protocols: Vec<Protocol>,
     mpp: Option<Arc<Mpp>>,
     x402: Arc<X402>,
     /// Usage-based x402 `upto` handler. `Some` only when `fee_payer_signer` is
@@ -148,6 +149,7 @@ const UPTO_MAX_TIMEOUT_SECONDS: u64 = 300;
 impl PayKit {
     /// Build both protocol handlers from one config.
     pub fn new(config: PayKitConfig) -> Result<Self, PayKitError> {
+        let accepted_protocols = config.accepted_protocols.clone();
         // x402's fee payer is an address; derive it from the shared signer so a
         // single config configures fee sponsorship for both protocols.
         let fee_payer_key = config
@@ -255,6 +257,7 @@ impl PayKit {
             .transpose()?;
 
         Ok(Self {
+            accepted_protocols,
             mpp,
             x402: Arc::new(x402),
             x402_upto,
