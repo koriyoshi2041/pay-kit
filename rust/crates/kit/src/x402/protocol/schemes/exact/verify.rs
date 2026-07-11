@@ -378,12 +378,26 @@ fn verify_transfer_instruction(
         return invalid("invalid_exact_svm_payload_no_transfer_instruction");
     }
 
+    let source = key_for_account_index(instruction.accounts[0], account_keys)?;
     let mint = key_for_account_index(instruction.accounts[1], account_keys)?;
     let destination = key_for_account_index(instruction.accounts[2], account_keys)?;
-    let authority = key_for_account_index(instruction.accounts[3], account_keys)?;
 
-    if managed_signers.iter().any(|managed| managed == authority) {
-        return invalid("invalid_exact_svm_payload_transaction_fee_payer_transferring_funds");
+    // Multisig transferChecked instructions place every signing authority in
+    // the account tail. A managed signer in any of those slots can move funds.
+    for account_index in instruction.accounts.iter().skip(3) {
+        let signer = key_for_account_index(*account_index, account_keys)?;
+        if managed_signers.contains(signer) {
+            return invalid("invalid_exact_svm_payload_transaction_fee_payer_transferring_funds");
+        }
+    }
+
+    // A delegate can move funds from a managed signer's ATA without naming
+    // that signer as authority. Derive with the transaction's actual token
+    // program because Token and Token-2022 produce different ATA addresses.
+    for managed in managed_signers {
+        if source == managed || source == &get_associated_token_address(managed, mint, program) {
+            return invalid("invalid_exact_svm_payload_transaction_fee_payer_transferring_funds");
+        }
     }
 
     let expected_mint = resolve_expected_mint(requirements);
