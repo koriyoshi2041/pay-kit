@@ -1,4 +1,4 @@
-import type { Store } from 'mppx';
+import { Errors, type Store } from 'mppx';
 
 /** Atomic replay-store contract required by MPP server construction. */
 export type ReplayStore = Store.Store & {
@@ -59,7 +59,7 @@ export function atomicReplayStoreView(store: ReplayStore): Store.Store {
         async put(key, value) {
             if (isConsumedReplayKey(key)) {
                 if (!(await store.putIfAbsent(key, value))) {
-                    throw new Error('MPP replay key is already reserved');
+                    throw new Errors.VerificationFailedError({ reason: 'MPP replay key is already reserved' });
                 }
                 return;
             }

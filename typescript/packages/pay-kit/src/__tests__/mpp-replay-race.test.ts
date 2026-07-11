@@ -103,6 +103,9 @@ describe('MPP replay-store adapter wiring', () => {
         await createMppAdapter(config).challengeHeaders(gate, new Request('http://test/subscription'));
         expect(captured.subscription).toHaveLength(1);
         await expect(captured.subscription[0].put('solana-subscription:consumed:id', true)).resolves.toBeUndefined();
-        await expect(captured.subscription[0].put('solana-subscription:consumed:id', true)).rejects.toThrow(/reserved/);
+        await expect(captured.subscription[0].put('solana-subscription:consumed:id', true)).rejects.toMatchObject({
+            message: expect.stringContaining('MPP replay key is already reserved'),
+            name: 'VerificationFailedError',
+        });
     });
 });
