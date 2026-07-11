@@ -9,7 +9,6 @@ use PayKit\Operator;
 use PayKit\PayCore\Network;
 use PayKit\Protocols\X402\Adapter;
 use PayKit\Signer;
-use PayKit\Store\MemoryStore;
 use PayKit\Tests\PayCore\Rpc\FakeRpcGateway;
 use PHPUnit\Framework\TestCase;
 use ReflectionMethod;
@@ -44,7 +43,7 @@ final class ConfirmationTest extends TestCase
         );
         return new Adapter(
             $config,
-            replayStore: new MemoryStore(),
+            replayStore: new ExplicitCapabilityTestReplayStore(),
             recentBlockhashProvider: fn () => null,
             rpc: $rpc,
             confirmationAttempts: $attempts,

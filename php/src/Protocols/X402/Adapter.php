@@ -18,12 +18,14 @@ use PayKit\PayCore\Rpc\SolanaRpcGateway;
 use PayKit\Protocols\X402\Exact\PaymentExtensions;
 use PayKit\Protocols\X402\Exact\Verifier;
 use PayKit\Store\MemoryStore;
+use PayKit\Store\ReplayStoreCapability;
 use PayKit\Store\Store;
 use Psr\Http\Message\ServerRequestInterface;
 use RuntimeException;
 use SolanaPhpSdk\Keypair\Keypair;
 use SolanaPhpSdk\Rpc\RpcClient;
 use SolanaPhpSdk\Transaction\VersionedTransaction;
+use SolanaPhpSdk\Util\Base58;
 use Throwable;
 
 /**
@@ -73,6 +75,8 @@ final class Adapter
      *        dev-only warning is emitted: a single-process memory store
      *        loses replay protection across workers/restarts, so production
      *        deployments MUST inject a shared atomic store (Redis, Postgres).
+     *        An explicitly injected store on non-localnet must also declare
+     *        the durable, shared, atomic replay capability.
      * @param ?RpcGateway $rpc Confirmation/broadcast gateway. Defaults to a
      *        {@see SolanaRpcGateway} over the configured `rpcUrl`, created
      *        lazily on first settlement. Inject a fake for unit tests.
@@ -93,6 +97,16 @@ final class Adapter
             throw new InvalidProofException(
                 'pay_kit: x402 delegated mode is not yet implemented; '
                 . 'leave X402Config::$facilitatorUrl null for self-hosted',
+            );
+        }
+        if (
+            $replayStore !== null
+            && $config->network !== Network::SolanaLocalnet
+            && (!$replayStore instanceof ReplayStoreCapability
+                || !$replayStore->providesDurableSharedReplayProtection())
+        ) {
+            throw new ConfigurationException(
+                'pay_kit: x402 replayStore must explicitly declare durable shared replay protection outside localnet',
             );
         }
         $this->replayStore = $replayStore ?? self::defaultReplayStore($config->network);
@@ -347,6 +361,14 @@ final class Adapter
         $kp = Keypair::fromSecretKey($signer->secretKey());
         $tx->partialSign($kp);
         $cosignedWire = $tx->serialize(verifySignatures: false);
+        $expectedSig = Base58::encode($tx->signatures[0]);
+
+        // Claim before the first RPC side effect. A transport error cannot
+        // prove the node did not accept the transaction, so the marker is
+        // deliberately retained on every broadcast/confirmation ambiguity.
+        if (!$this->replayStore->putIfAbsent(self::REPLAY_KEY_PREFIX . $expectedSig, true)) {
+            throw new InvalidProofException('pay_kit: signature_consumed');
+        }
 
         // Broadcast via the raw-wire path so PHP doesn't have to
         // reconstruct a SignedTransaction wrapper just to send.
@@ -365,16 +387,8 @@ final class Adapter
         if (!is_string($sig) || $sig === '') {
             throw new InvalidProofException('pay_kit: empty broadcast result');
         }
-
-        // Reserve in the replay store BETWEEN broadcast and confirmation.
-        // RPC has accepted the transaction, so it may land even if the
-        // await below times out or the process crashes. Reserving first
-        // means a retry of the same credential trips the consumed guard
-        // rather than re-settling. Mirrors the MPP SolanaChargeHandler
-        // (settle() reserves between sendRawTransaction and
-        // awaitConfirmation; PR #85 Greptile P1 / audit gap G05).
-        if (!$this->replayStore->putIfAbsent(self::REPLAY_KEY_PREFIX . $sig, true)) {
-            throw new InvalidProofException('pay_kit: signature_consumed');
+        if ($sig !== $expectedSig) {
+            throw new InvalidProofException('pay_kit: broadcast signature mismatch');
         }
 
         // Confirm BEFORE returning the payment-response success. RPC
@@ -492,7 +506,7 @@ final class Adapter
         if (!is_array($accepted)) {
             throw new InvalidProofException('invalid_exact_svm_payload_envelope');
         }
-        foreach (['scheme', 'network', 'asset', 'payTo'] as $key) {
+        foreach (['scheme', 'network', 'asset', 'payTo', 'amount', 'maxAmountRequired'] as $key) {
             if (($accepted[$key] ?? null) !== ($offer[$key] ?? null)) {
                 throw new InvalidProofException(
                     'pay_kit: charge_request_mismatch: '

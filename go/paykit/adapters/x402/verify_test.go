@@ -48,11 +48,11 @@ func newFixture(t *testing.T) fixture {
 	}
 
 	keys := solana.PublicKeySlice{
-		feePayer,      // 0
-		source,        // 1
-		mint,          // 2
-		dest,          // 3
-		authority,     // 4
+		feePayer,      // 0: fee payer signer
+		authority,     // 1: transfer authority signer
+		source,        // 2
+		mint,          // 3
+		dest,          // 4
 		computeBudget, // 5
 		tokenProgram,  // 6
 	}
@@ -73,7 +73,7 @@ func newFixture(t *testing.T) fixture {
 		computePrice: solana.CompiledInstruction{ProgramIDIndex: 5, Data: priceData},
 		transfer: solana.CompiledInstruction{
 			ProgramIDIndex: 6,
-			Accounts:       []uint16{1, 2, 3, 4},
+			Accounts:       []uint16{2, 3, 4, 1},
 			Data:           transferData,
 		},
 		req: proto.TransferRequirements{
@@ -89,8 +89,12 @@ func newFixture(t *testing.T) fixture {
 func (f fixture) tx(extra ...solana.CompiledInstruction) *solana.Transaction {
 	ixs := append([]solana.CompiledInstruction{f.computeLimit, f.computePrice, f.transfer}, extra...)
 	return &solana.Transaction{
-		Message:    solana.Message{AccountKeys: f.keys, Instructions: ixs},
-		Signatures: []solana.Signature{{}},
+		Message: solana.Message{
+			AccountKeys:  f.keys,
+			Header:       solana.MessageHeader{NumRequiredSignatures: 2},
+			Instructions: ixs,
+		},
+		Signatures: []solana.Signature{{}, {}},
 	}
 }
 
@@ -177,8 +181,12 @@ func TestVerifyEnforcesExpectedMemoMatch(t *testing.T) {
 func TestVerifyRejectsTooFewInstructions(t *testing.T) {
 	f := newFixture(t)
 	tx := &solana.Transaction{
-		Message:    solana.Message{AccountKeys: f.keys, Instructions: []solana.CompiledInstruction{f.computeLimit, f.computePrice}},
-		Signatures: []solana.Signature{{}},
+		Message: solana.Message{
+			AccountKeys:  f.keys,
+			Header:       solana.MessageHeader{NumRequiredSignatures: 2},
+			Instructions: []solana.CompiledInstruction{f.computeLimit, f.computePrice},
+		},
+		Signatures: []solana.Signature{{}, {}},
 	}
 	if err := proto.VerifyExactTransaction(tx, f.req); err == nil {
 		t.Error("expected rejection for <3 instructions")
@@ -222,7 +230,7 @@ func TestVerifyRejectsWrongAmount(t *testing.T) {
 
 func TestVerifyRejectsWrongMint(t *testing.T) {
 	f := newFixture(t)
-	f.keys[2] = solana.MustPublicKeyFromBase58(paycore.USDTMainnetMint)
+	f.keys[3] = solana.MustPublicKeyFromBase58(paycore.USDTMainnetMint)
 	if err := proto.VerifyExactTransaction(f.tx(), f.req); err == nil {
 		t.Error("expected rejection for mint mismatch")
 	}
@@ -230,7 +238,7 @@ func TestVerifyRejectsWrongMint(t *testing.T) {
 
 func TestVerifyRejectsWrongDestination(t *testing.T) {
 	f := newFixture(t)
-	f.keys[3] = solana.NewWallet().PublicKey() // not the payTo ATA
+	f.keys[4] = solana.NewWallet().PublicKey() // not the payTo ATA
 	if err := proto.VerifyExactTransaction(f.tx(), f.req); err == nil {
 		t.Error("expected rejection for recipient ATA mismatch")
 	}
@@ -238,7 +246,7 @@ func TestVerifyRejectsWrongDestination(t *testing.T) {
 
 func TestVerifyRejectsFeePayerAsAuthority(t *testing.T) {
 	f := newFixture(t)
-	f.keys[4] = f.req.FeePayer // fee-payer moving the funds
+	f.keys[1] = f.req.FeePayer // fee-payer moving the funds
 	if err := proto.VerifyExactTransaction(f.tx(), f.req); err == nil {
 		t.Error("expected rejection when fee-payer is the transfer authority")
 	}
@@ -321,7 +329,7 @@ func settleFixture(t *testing.T, fake *fakeRPC) (*Adapter, *paykit.Gate, string)
 	}
 	computeBudget := solana.MustPublicKeyFromBase58(proto.ComputeBudgetProgram)
 
-	keys := solana.PublicKeySlice{opPub, source, mint, dest, authority, computeBudget, tokenProgram}
+	keys := solana.PublicKeySlice{opPub, authority, source, mint, dest, computeBudget, tokenProgram}
 	const amount = uint64(1000)
 	priceData := make([]byte, 9)
 	priceData[0] = 3
@@ -333,10 +341,11 @@ func settleFixture(t *testing.T, fake *fakeRPC) (*Adapter, *paykit.Gate, string)
 	tx := &solana.Transaction{
 		Message: solana.Message{
 			AccountKeys: keys,
+			Header:      solana.MessageHeader{NumRequiredSignatures: 2},
 			Instructions: []solana.CompiledInstruction{
 				{ProgramIDIndex: 5, Data: []byte{2, 0, 0, 0, 0}},
 				{ProgramIDIndex: 5, Data: priceData},
-				{ProgramIDIndex: 6, Accounts: []uint16{1, 2, 3, 4}, Data: transferData},
+				{ProgramIDIndex: 6, Accounts: []uint16{2, 3, 4, 1}, Data: transferData},
 			},
 		},
 		Signatures: []solana.Signature{{}, solana.MustSignatureFromBase58(sampleClientSig)},
@@ -616,6 +625,7 @@ func TestCosignPassthroughWhenOperatorAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	tx.Signatures = make([]solana.Signature, len(tx.Message.Signers()))
 	raw, err := tx.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)

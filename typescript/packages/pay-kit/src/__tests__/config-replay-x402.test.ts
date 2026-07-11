@@ -3,13 +3,17 @@ import { describe, expect, it } from 'vitest';
 
 import { configure } from '../config.js';
 import { ConfigurationError } from '../errors.js';
-import { createMemoryReplayStore, isReservingReplayStore } from '../replay-store.js';
+import { createMemoryReplayStore, isReservingReplayStore, type ReservingReplayStore } from '../replay-store.js';
 import { Signer } from '../signer.js';
 
 // An x402-only accept list must fail closed on the replay store exactly like the
 // mpp path: off localnet the default in-memory store is process-local, so a
 // second replica or a restart would accept a replayed payment. See SECURITY.md.
 const X402 = { accept: ['x402'] as const, mpp: { challengeBindingSecret: 'test-secret' } };
+
+function sharedReplayStore() {
+    return { ...createMemoryReplayStore(), isDurable: true as const, isShared: true as const };
+}
 
 describe('configure replay store for x402-only accept lists', () => {
     it('fails closed off localnet when no replay store is provided', async () => {
@@ -25,10 +29,35 @@ describe('configure replay store for x402-only accept lists', () => {
             ...X402,
             network: 'solana_mainnet',
             operator: { signer },
-            replayStore: createMemoryReplayStore(),
+            replayStore: sharedReplayStore(),
         });
         expect(config.replayStore).toBeDefined();
         expect(isReservingReplayStore(config.replayStore!)).toBe(true);
+    });
+
+    it('rejects a process-local atomic store off localnet', async () => {
+        const signer = await Signer.generate();
+        await expect(
+            configure({
+                ...X402,
+                network: 'solana_mainnet',
+                operator: { signer },
+                replayStore: createMemoryReplayStore(),
+            }),
+        ).rejects.toThrow(/isShared=true and isDurable=true/);
+    });
+
+    it('rejects a durable but process-local store off localnet', async () => {
+        const signer = await Signer.generate();
+        const durableOnly: ReservingReplayStore = { ...createMemoryReplayStore(), isDurable: true };
+        await expect(
+            configure({
+                ...X402,
+                network: 'solana_mainnet',
+                operator: { signer },
+                replayStore: durableOnly,
+            }),
+        ).rejects.toThrow(/isShared=true and isDurable=true/);
     });
 
     it('rejects a store without atomic reserve capability', async () => {

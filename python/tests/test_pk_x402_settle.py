@@ -9,6 +9,7 @@ helpers (``_co_sign``, ``_is_loopback_rpc``, ``_request_path``, header reader).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import struct
@@ -63,6 +64,8 @@ class _FakeRpc:
         signature: str = "SIG-broadcast",
         fail: bool = False,
         confirm_error: Exception | None = None,
+        send_entered: asyncio.Event | None = None,
+        release_send: asyncio.Event | None = None,
         **_k,
     ):
         self._signature = signature
@@ -70,8 +73,16 @@ class _FakeRpc:
         self._confirm_error = confirm_error
         self.confirm_calls = 0
         self.aclose_calls = 0
+        self.send_calls = 0
+        self._send_entered = send_entered
+        self._release_send = release_send
 
     async def send_raw_transaction(self, _raw):
+        self.send_calls += 1
+        if self._send_entered is not None:
+            self._send_entered.set()
+        if self._release_send is not None:
+            await self._release_send.wait()
         if self._fail:
             raise RuntimeError("broadcast boom")
 
@@ -100,7 +111,16 @@ def _clean(monkeypatch):
     reset()
 
 
-def _adapter(store=None, signature="SIG-broadcast", fail=False, confirm_error=None, monkeypatch=None, rpcs=None):
+def _adapter(
+    store=None,
+    signature="SIG-broadcast",
+    fail=False,
+    confirm_error=None,
+    monkeypatch=None,
+    rpcs=None,
+    send_entered=None,
+    release_send=None,
+):
     op_kp = Keypair()
     op = Operator(signer=LocalSigner.from_keypair(op_kp), recipient=str(Keypair().pubkey()))
     cfg = configure(
@@ -119,7 +139,13 @@ def _adapter(store=None, signature="SIG-broadcast", fail=False, confirm_error=No
     adapter = X402Adapter(cfg, replay_store=store or MemoryStore())
 
     def _factory(*_a, **_k):
-        rpc = _FakeRpc(signature=signature, fail=fail, confirm_error=confirm_error)
+        rpc = _FakeRpc(
+            signature=signature,
+            fail=fail,
+            confirm_error=confirm_error,
+            send_entered=send_entered,
+            release_send=release_send,
+        )
         if rpcs is not None:
             rpcs.append(rpc)
         return rpc
@@ -169,6 +195,14 @@ class _Req:
         self.path = path
 
 
+def _replay_key(header, op_kp):
+    envelope = json.loads(base64.b64decode(header))
+    transaction = envelope["payload"]["transaction"]
+    signer = LocalSigner.from_keypair(op_kp)
+    signature = xmod._transaction_signature(xmod._co_sign(transaction, signer))
+    return "x402-svm-exact:consumed:" + signature
+
+
 # -- happy path + replay -----------------------------------------------------
 
 
@@ -189,19 +223,59 @@ async def test_replay_same_signature_rejected(monkeypatch):
     adapter, gate, op_kp = _adapter(store=store, signature="SIG-dupe", monkeypatch=monkeypatch)
     header = _build_envelope(adapter, gate, op_kp)
     await adapter.verify_and_settle(gate, _Req(header))
-    # Second submit of a credential that broadcasts the same signature: consumed.
-    header2 = _build_envelope(adapter, gate, op_kp)
+    # The exact same credential must be rejected before a second broadcast.
+    header2 = header
     with pytest.raises(InvalidProofError) as exc:
         await adapter.verify_and_settle(gate, _Req(header2))
     assert exc.value.code == "signature_consumed"
 
 
 @pytest.mark.asyncio
+async def test_concurrent_duplicate_credential_sends_at_most_once(monkeypatch):
+    store = MemoryStore()
+    rpcs = []
+    send_entered = asyncio.Event()
+    release_send = asyncio.Event()
+    adapter, gate, op_kp = _adapter(
+        store=store,
+        monkeypatch=monkeypatch,
+        rpcs=rpcs,
+        send_entered=send_entered,
+        release_send=release_send,
+    )
+    header = _build_envelope(adapter, gate, op_kp)
+
+    first_task = asyncio.create_task(adapter.verify_and_settle(gate, _Req(header)))
+    second_task = asyncio.create_task(adapter.verify_and_settle(gate, _Req(header)))
+    await send_entered.wait()
+    await asyncio.sleep(0)
+    release_send.set()
+    first, second = await asyncio.gather(
+        first_task,
+        second_task,
+        return_exceptions=True,
+    )
+
+    results = (first, second)
+    assert sum(isinstance(result, InvalidProofError) for result in results) == 1
+    assert sum(not isinstance(result, BaseException) for result in results) == 1
+    assert sum(rpc.send_calls for rpc in rpcs) == 1
+
+
+@pytest.mark.asyncio
 async def test_broadcast_failure_is_invalid_proof(monkeypatch):
-    adapter, gate, op_kp = _adapter(fail=True, monkeypatch=monkeypatch)
+    store = MemoryStore()
+    rpcs = []
+    adapter, gate, op_kp = _adapter(store=store, fail=True, monkeypatch=monkeypatch, rpcs=rpcs)
     header = _build_envelope(adapter, gate, op_kp)
     with pytest.raises(InvalidProofError, match="broadcast failed"):
         await adapter.verify_and_settle(gate, _Req(header))
+    # A send error is ambiguous: retain the reservation so a retry cannot
+    # submit the same credential after a node accepted it before the error.
+    with pytest.raises(InvalidProofError) as replay_exc:
+        await adapter.verify_and_settle(gate, _Req(header))
+    assert replay_exc.value.code == "signature_consumed"
+    assert sum(rpc.send_calls for rpc in rpcs) == 1
 
 
 # -- confirmation gate (149-2 BLOCKER) ---------------------------------------
@@ -237,7 +311,7 @@ async def test_confirmation_timeout_raises_and_does_not_return_success(monkeypat
     assert "confirmation failed" in str(exc.value)
     # Timeout is inconclusive: the transaction may still land, so the atomic
     # reservation must remain and a retry cannot serve the same payment again.
-    assert await store.get("x402-svm-exact:consumed:SIG-timeout") is True
+    assert await store.get(_replay_key(header, op_kp)) is True
     with pytest.raises(InvalidProofError) as replay_exc:
         await adapter.verify_and_settle(gate, _Req(header))
     assert replay_exc.value.code == "signature_consumed"
@@ -257,7 +331,7 @@ async def test_confirmation_onchain_failure_keeps_reservation(monkeypatch):
     header = _build_envelope(adapter, gate, op_kp)
     with pytest.raises(InvalidProofError):
         await adapter.verify_and_settle(gate, _Req(header))
-    assert await store.get("x402-svm-exact:consumed:SIG-revert") is True
+    assert await store.get(_replay_key(header, op_kp)) is True
 
 
 # -- sub-microunit price truncation (149-2) ----------------------------------

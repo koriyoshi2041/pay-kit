@@ -17,13 +17,14 @@ import { UptoSvmScheme as UptoSvmFacilitator } from '@x402/svm/upto/facilitator'
 
 import { requireMint, resolveCoin } from '../coin.js';
 import type { PayKitConfig } from '../config.js';
-import { InvalidProofError } from '../errors.js';
+import { ConfigurationError, InvalidProofError } from '../errors.js';
 import type { Price } from '../price.js';
 import { caip2 } from '../protocol.js';
 import {
     assertPaymentHeaderWithinCap,
     ChallengeBlockhashCache,
     errorMessage,
+    isReservingReplayStore,
     x402PaymentHeader,
 } from './x402-shared.js';
 
@@ -35,6 +36,8 @@ const X402_VERSION = 2;
 const MAX_TIMEOUT_SECONDS = 300;
 const DEFAULT_WITHDRAW_DELAY_SECONDS = 900;
 const BASIS_POINTS_DENOMINATOR = 10_000;
+const CONSUMED_PREFIX = 'x402-svm-upto:consumed:';
+const ROUTE_PREFIX = 'x402-svm-upto:route:';
 
 /**
  * Usage meter handed to a usage-gated handler. The handler reports the actual
@@ -53,13 +56,19 @@ export class Charge {
         this.maxBaseUnits = maxBaseUnits;
     }
 
-    /** Record the actual amount consumed (base units). Values above the ceiling are clamped; negatives floor to 0. */
+    /** Record the actual amount consumed (base units). Invalid negative values and overages reject at settlement. */
     charge(baseUnits: bigint | number): void {
         const value = typeof baseUnits === 'bigint' ? baseUnits : BigInt(Math.trunc(baseUnits));
-        this.#amount = value < 0n ? 0n : value > this.maxBaseUnits ? this.maxBaseUnits : value;
+        if (value < 0n) {
+            throw new InvalidProofError(
+                'invalid_upto_svm_payload_settlement_negative_amount',
+                `settlement amount ${value} must be non-negative`,
+            );
+        }
+        this.#amount = value;
     }
 
-    /** The amount to settle (base units): the clamped charge, or `0` if never set. */
+    /** The amount to settle (base units): the recorded charge, or `0` if never set. */
     settledBaseUnits(): bigint {
         return this.#amount ?? 0n;
     }
@@ -103,6 +112,7 @@ export class X402Upto {
     readonly #signer: PayKitConfig['operator']['signer'];
     readonly #recipient: string;
     readonly #rpcUrl: string;
+    readonly #replayStore: import('../replay-store.js').ReservingReplayStore;
     readonly #stablecoins: readonly string[];
     readonly #blockhashCache = new ChallengeBlockhashCache();
 
@@ -113,6 +123,10 @@ export class X402Upto {
         this.#signer = config.operator.signer;
         this.#recipient = config.operator.recipient;
         this.#rpcUrl = config.rpcUrl;
+        if (config.replayStore === undefined || !isReservingReplayStore(config.replayStore)) {
+            throw new ConfigurationError('x402 upto requires a replayStore with atomic reserve capability.');
+        }
+        this.#replayStore = config.replayStore;
         this.#stablecoins = config.stablecoins;
         this.#facilitator = new x402Facilitator().register(
             this.#network,
@@ -150,7 +164,8 @@ export class X402Upto {
      * requirement (`extra.recentBlockhash` + `extra.recentSlot`) the header
      * carries, so body-based `upto` clients can build the channel open too.
      */
-    async accepts(maxPrice: Price): Promise<readonly PaymentRequirements[]> {
+    async accepts(maxPrice: Price, request?: Request): Promise<readonly PaymentRequirements[]> {
+        void request;
         return [await this.#challengeRequirements(maxPrice)];
     }
 
@@ -177,17 +192,42 @@ export class X402Upto {
         if (!verification.isValid) {
             throw new InvalidProofError(verification.invalidReason ?? 'invalid_proof', verification.invalidMessage);
         }
-        return { maxBaseUnits: BigInt(requirements.amount), payer: verification.payer ?? '', payload, requirements };
+        const channel = parseUptoPayload(payload);
+        const ttlSeconds = Math.max(MAX_TIMEOUT_SECONDS, channel.expiresAt - Math.floor(Date.now() / 1000));
+        await this.#bindChannelRoute(channel.channelId, request, ttlSeconds);
+        const channelId = channel.channelId;
+        const replayKey = `${CONSUMED_PREFIX}${channelId}`;
+        if (!(await this.#replayStore.reserve(replayKey, true, ttlSeconds))) {
+            throw new InvalidProofError('upto_channel_replayed', 'channel already used or in flight');
+        }
+        return {
+            maxBaseUnits: BigInt(requirements.amount),
+            payer: verification.payer ?? '',
+            payload,
+            requirements,
+        };
     }
 
     /**
-     * Settle the metered amount (`actualBaseUnits`, clamped to the ceiling) against
-     * a verified open: receiver-authorizer voucher, settle-and-seal, refund the remainder.
+     * Settle the metered amount (`actualBaseUnits`) against a verified open:
+     * receiver-authorizer voucher, settle-and-seal, refunding the remainder.
      *
-     * @throws {InvalidProofError} when settlement fails.
+     * @throws {InvalidProofError} when the meter exceeds its authorized ceiling or settlement fails.
      */
     async settle(verified: UptoVerified, actualBaseUnits: bigint): Promise<UptoSettlement> {
-        const actual = actualBaseUnits > verified.maxBaseUnits ? verified.maxBaseUnits : actualBaseUnits;
+        if (actualBaseUnits < 0n) {
+            throw new InvalidProofError(
+                'invalid_upto_svm_payload_settlement_negative_amount',
+                `settlement amount ${actualBaseUnits} must be non-negative`,
+            );
+        }
+        if (actualBaseUnits > verified.maxBaseUnits) {
+            throw new InvalidProofError(
+                'invalid_upto_svm_payload_settlement_exceeds_amount',
+                `settlement amount ${actualBaseUnits} exceeds authorized ceiling ${verified.maxBaseUnits}`,
+            );
+        }
+        const actual = actualBaseUnits;
         const payload = parseUptoPayload(verified.payload);
         const rpc = createSolanaRpc(this.#rpcUrl);
         const confirmRpc = rpc as unknown as SettlementConfirmRpc;
@@ -248,6 +288,29 @@ export class X402Upto {
         const message = encodeVoucherMessageBytes({ channelId, cumulativeAmount, expiresAt });
         const signature = await this.#signer.sign(message);
         return getBase58Decoder().decode(signature);
+    }
+
+    /**
+     * Bind a verified channel's replay scope to the first route that accepts it.
+     *
+     * The x402 `upto` wire commits the channel ID in the payer-signed open
+     * transaction, so this reservation is channel-specific and does not block
+     * unrelated routes. It does not prove which HTTP route issued the
+     * challenge: the upstream `upto` transaction has no resource-path field.
+     * A route-specific cryptographic guarantee therefore requires a protocol
+     * extension; this is only a fail-closed same-channel replay binding.
+     */
+    async #bindChannelRoute(channelId: string, request: Request, ttlSeconds: number): Promise<void> {
+        const route = new URL(request.url).pathname;
+        const key = `${ROUTE_PREFIX}${this.#network}:${this.#recipient}:${channelId}`;
+        if (await this.#replayStore.reserve(key, route, ttlSeconds)) return;
+        const existing = await this.#replayStore.get(key);
+        if (existing !== route) {
+            throw new InvalidProofError(
+                'upto_route_mismatch',
+                `x402 upto is already bound to route ${String(existing)}`,
+            );
+        }
     }
 
     #requirements(maxPrice: Price): PaymentRequirements {
@@ -313,7 +376,9 @@ function parseUptoPayload(payload: PaymentPayload): UptoPaymentChannelPayload {
         !raw ||
         typeof raw.channelId !== 'string' ||
         typeof raw.from !== 'string' ||
-        typeof raw.expiresAt !== 'number'
+        typeof raw.expiresAt !== 'number' ||
+        !Number.isSafeInteger(raw.expiresAt) ||
+        raw.expiresAt <= 0
     ) {
         throw new InvalidProofError('invalid_upto_payload');
     }

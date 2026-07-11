@@ -69,9 +69,14 @@ func New(cfg paykit.Config) (paykit.Adapter, error) {
 	store := cfg.X402.ReplayStore
 	if store == nil {
 		if cfg.Network != paykit.SolanaLocalnet && os.Getenv("PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE") != "1" {
-			return nil, errors.New("protocols/x402: non-localnet exact settlement requires X402.ReplayStore; inject a shared atomic store or set PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1 to acknowledge process-local replay protection")
+			return nil, errors.New("protocols/x402: non-localnet exact settlement requires X402.ReplayStore with durable shared replay capability; inject a shared atomic store or set PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1 to acknowledge process-local replay protection")
 		}
 		store = mppcore.NewMemoryStore()
+	} else if cfg.Network != paykit.SolanaLocalnet && os.Getenv("PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE") != "1" {
+		capability, ok := store.(paykit.ReplayStoreCapability)
+		if !ok || !capability.ProvidesDurableSharedReplayProtection() {
+			return nil, errors.New("protocols/x402: non-localnet X402.ReplayStore must implement ReplayStoreCapability and report durable shared replay protection; set PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1 only for an explicit process-local override")
+		}
 	}
 	a := &Adapter{
 		cfg:               cfg,
@@ -95,7 +100,10 @@ func (a *Adapter) AcceptsEntry(gate *paykit.Gate) paykit.AcceptsEntry {
 	coin := a.settlementCoin(gate)
 	label := a.cfg.Network.MintsLabel()
 	mint := paycore.ResolveMint(coin, label)
-	amount := a.totalUnits(gate, coin)
+	amount, err := a.totalUnits(gate, coin)
+	if err != nil {
+		return nil
+	}
 	payTo := a.payTo(gate)
 	extra := proto.Extra{
 		FeePayer:     true,
@@ -124,6 +132,9 @@ func (a *Adapter) AcceptsEntry(gate *paykit.Gate) paykit.AcceptsEntry {
 
 func (a *Adapter) ChallengeHeaders(gate *paykit.Gate) map[string]string {
 	entry := a.AcceptsEntry(gate)
+	if entry == nil {
+		return nil
+	}
 	accepts := []paykit.AcceptsEntry{entry}
 	envelope := map[string]interface{}{
 		"x402Version": proto.X402Version,
@@ -161,6 +172,14 @@ func (a *Adapter) advertisedExtensions() json.RawMessage {
 
 func (a *Adapter) VerifyAndSettle(req *paykit.AdapterRequest) (*paykit.Payment, error) {
 	ctx := context.Background()
+	gate := *req.Gate
+	if req.Path != "" {
+		gate.Desc = req.Path
+	}
+	req.Gate = &gate
+	if _, err := a.totalUnits(req.Gate, a.settlementCoin(req.Gate)); err != nil {
+		return nil, &paykit.PaymentError{Code: "invalid_gate", Err: err, Gate: req.Gate}
+	}
 	sig := req.PaymentSig
 	if sig == "" {
 		sig = req.PaymentSigLegacy
@@ -363,7 +382,10 @@ func (a *Adapter) verifyLegacyBinding(gate *paykit.Gate, credential *proto.Crede
 	if credential.Scheme != proto.ExactScheme {
 		return fmt.Errorf("scheme mismatch: expected %s, got %q", proto.ExactScheme, credential.Scheme)
 	}
-	route := a.routeAccepts(gate)
+	route, err := a.routeAccepts(gate)
+	if err != nil {
+		return err
+	}
 	got := normalizeNetwork(credential.Network)
 	if got != route.Network {
 		return fmt.Errorf("network mismatch: expected %s, got %s", route.Network, credential.Network)
@@ -372,7 +394,10 @@ func (a *Adapter) verifyLegacyBinding(gate *paykit.Gate, credential *proto.Crede
 }
 
 func (a *Adapter) verifyAcceptedBinding(gate *paykit.Gate, accepted *proto.AcceptsEntry) error {
-	route := a.routeAccepts(gate)
+	route, err := a.routeAccepts(gate)
+	if err != nil {
+		return err
+	}
 	if accepted.Network != route.Network {
 		return fmt.Errorf("network mismatch: expected %s, got %s", route.Network, accepted.Network)
 	}
@@ -399,16 +424,20 @@ func (a *Adapter) verifyAcceptedBinding(gate *paykit.Gate, accepted *proto.Accep
 	return nil
 }
 
-func (a *Adapter) routeAccepts(gate *paykit.Gate) proto.AcceptsEntry {
+func (a *Adapter) routeAccepts(gate *paykit.Gate) (proto.AcceptsEntry, error) {
 	coin := a.settlementCoin(gate)
 	label := a.cfg.Network.MintsLabel()
+	amount, err := a.totalUnits(gate, coin)
+	if err != nil {
+		return proto.AcceptsEntry{}, err
+	}
 	return proto.AcceptsEntry{
 		Protocol:          "x402",
 		Scheme:            a.cfg.X402.Scheme,
 		Network:           a.cfg.Network.CAIP2(),
 		Asset:             paycore.ResolveMint(coin, label),
-		Amount:            a.totalUnits(gate, coin),
-		MaxAmountRequired: a.totalUnits(gate, coin),
+		Amount:            amount,
+		MaxAmountRequired: amount,
 		PayTo:             string(a.payTo(gate)),
 		MaxTimeoutSeconds: proto.DefaultMaxTimeoutSeconds,
 		Extra: proto.Extra{
@@ -420,7 +449,7 @@ func (a *Adapter) routeAccepts(gate *paykit.Gate) proto.AcceptsEntry {
 			TokenProgram: paycore.DefaultTokenProgramForCurrency(coin, label),
 			Memo:         gate.Desc,
 		},
-	}
+	}, nil
 }
 
 func canonicalAccepted(e *proto.AcceptsEntry) ([]byte, error) {
@@ -451,7 +480,11 @@ func (a *Adapter) transferRequirements(gate *paykit.Gate) (proto.TransferRequire
 	if err != nil {
 		return proto.TransferRequirements{}, fmt.Errorf("operator pubkey: %w", err)
 	}
-	amount, err := strconv.ParseUint(a.totalUnits(gate, coin), 10, 64)
+	amountText, err := a.totalUnits(gate, coin)
+	if err != nil {
+		return proto.TransferRequirements{}, fmt.Errorf("amount: %w", err)
+	}
+	amount, err := strconv.ParseUint(amountText, 10, 64)
 	if err != nil {
 		return proto.TransferRequirements{}, fmt.Errorf("amount: %w", err)
 	}
@@ -466,6 +499,9 @@ func (a *Adapter) transferRequirements(gate *paykit.Gate) (proto.TransferRequire
 }
 
 func (a *Adapter) cosign(ctx context.Context, tx *solana.Transaction, rawTx []byte) ([]byte, error) {
+	if tx == nil {
+		return nil, errors.New("transaction is nil")
+	}
 	operator, err := solana.PublicKeyFromBase58(string(a.signer.Pubkey()))
 	if err != nil {
 		return nil, fmt.Errorf("operator pubkey: %w", err)
@@ -478,8 +514,19 @@ func (a *Adapter) cosign(ctx context.Context, tx *solana.Transaction, rawTx []by
 	// a scan would then spend the operator's signature on a slot it never
 	// intended to authorize while leaving the real fee payer unsigned. Mirrors
 	// the Rust/TS index-0 pin.
-	keys := tx.Message.AccountKeys
-	if len(keys) == 0 || !keys[0].Equals(operator) {
+	signers := tx.Message.Signers()
+	requiredSigners := int(tx.Message.Header.NumRequiredSignatures)
+	if requiredSigners == 0 || len(signers) != requiredSigners || len(tx.Signatures) != requiredSigners {
+		return nil, fmt.Errorf("invalid signer vector: message requires %d signatures, transaction carries %d", requiredSigners, len(tx.Signatures))
+	}
+	// Solana debits the fee payer, so the first required signer must be
+	// writable. A message marking every required signer read-only is invalid;
+	// refuse to sign it instead of producing an operator signature for a
+	// transaction that cannot be a valid fee-paying transaction.
+	if int(tx.Message.Header.NumReadonlySignedAccounts) >= requiredSigners {
+		return nil, errors.New("invalid fee payer: first required signer is read-only")
+	}
+	if !signers[0].Equals(operator) {
 		// The operator is not this transaction's fee payer, so it has nothing to
 		// co-sign. Return the wire unchanged rather than signing an off-slot key.
 		return rawTx, nil
@@ -648,9 +695,17 @@ func (a *Adapter) payTo(gate *paykit.Gate) paykit.Address {
 	return a.cfg.Operator.Recipient
 }
 
-func (a *Adapter) totalUnits(gate *paykit.Gate, _ string) string {
-	scaled := gate.Total().Amount().Shift(int32(proto.StablecoinDecimals))
-	return scaled.Truncate(0).String()
+func (a *Adapter) totalUnits(gate *paykit.Gate, _ string) (string, error) {
+	total := gate.Total().Amount()
+	scaled := total.Shift(int32(proto.StablecoinDecimals))
+	units := scaled.Truncate(0)
+	if total.IsPositive() && units.IsZero() {
+		return "", fmt.Errorf("price %s resolves below one base unit", total)
+	}
+	if !scaled.Equal(units) {
+		return "", fmt.Errorf("price %s is not representable in base units", total)
+	}
+	return units.String(), nil
 }
 
 func normalizeNetwork(network string) string {

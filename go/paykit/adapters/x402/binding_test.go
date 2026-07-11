@@ -38,11 +38,75 @@ func encodeCredential(t *testing.T, cred proto.Credential) string {
 	return base64.StdEncoding.EncodeToString(raw)
 }
 
+func TestTotalUnitsRejectsPositiveSubBaseUnitPrice(t *testing.T) {
+	a := bindingAdapter(t)
+	gate := &paykit.Gate{Amount: paykit.MustParseUSD("0.0000009")}
+
+	if _, err := a.totalUnits(gate, "USDC"); err == nil {
+		t.Fatal("expected a positive price below one base unit to be rejected")
+	}
+	if entry := a.AcceptsEntry(gate); entry != nil {
+		t.Fatal("sub-base-unit price must not produce an x402 accepts entry")
+	}
+	if headers := a.ChallengeHeaders(gate); headers != nil {
+		t.Fatal("sub-base-unit price must not produce x402 challenge headers")
+	}
+
+	_, err := a.VerifyAndSettle(&paykit.AdapterRequest{
+		Gate:       gate,
+		PaymentSig: encodeCredential(t, proto.Credential{}),
+	})
+	var perr *paykit.PaymentError
+	if !errors.As(err, &perr) || perr.Code != "invalid_gate" {
+		t.Fatalf("expected invalid_gate for sub-base-unit price, got %v", err)
+	}
+}
+
+func TestTotalUnitsRejectsFractionalBaseUnitPrice(t *testing.T) {
+	a := bindingAdapter(t)
+	gate := &paykit.Gate{Amount: paykit.MustParseUSD("0.0000019")}
+
+	if _, err := a.totalUnits(gate, "USDC"); err == nil {
+		t.Fatal("expected a fractional base-unit price to be rejected")
+	}
+}
+
+func TestTotalUnitsBindsExactlyOneBaseUnit(t *testing.T) {
+	a := bindingAdapter(t)
+	gate := &paykit.Gate{Amount: paykit.MustParseUSD("0.000001")}
+
+	units, err := a.totalUnits(gate, "USDC")
+	if err != nil {
+		t.Fatalf("one base unit should be accepted: %v", err)
+	}
+	if units != "1" {
+		t.Fatalf("totalUnits = %q, want %q", units, "1")
+	}
+
+	route, err := a.routeAccepts(gate)
+	if err != nil {
+		t.Fatalf("routeAccepts: %v", err)
+	}
+	if route.Amount != "1" || route.MaxAmountRequired != "1" {
+		t.Fatalf("route amounts = (%q, %q), want (1, 1)", route.Amount, route.MaxAmountRequired)
+	}
+	reqs, err := a.transferRequirements(gate)
+	if err != nil {
+		t.Fatalf("transferRequirements: %v", err)
+	}
+	if reqs.Amount != 1 {
+		t.Fatalf("transfer amount = %d, want 1", reqs.Amount)
+	}
+}
+
 func TestVerifyRejectsLyingAcceptedAmount(t *testing.T) {
 	a := bindingAdapter(t)
 	gate := paykit.Gate{Amount: paykit.MustParseUSD("0.10")}
 
-	route := a.routeAccepts(&gate)
+	route, err := a.routeAccepts(&gate)
+	if err != nil {
+		t.Fatal(err)
+	}
 	tampered := route
 	tampered.Amount = "999999999"
 	tampered.MaxAmountRequired = "999999999"
@@ -52,7 +116,7 @@ func TestVerifyRejectsLyingAcceptedAmount(t *testing.T) {
 		Payload:     proto.CredentialPayload{Transaction: base64.StdEncoding.EncodeToString([]byte("ignored"))},
 		Accepted:    &tampered,
 	}
-	_, err := a.VerifyAndSettle(&paykit.AdapterRequest{Gate: &gate, PaymentSig: encodeCredential(t, cred)})
+	_, err = a.VerifyAndSettle(&paykit.AdapterRequest{Gate: &gate, PaymentSig: encodeCredential(t, cred)})
 	var perr *paykit.PaymentError
 	if !errors.As(err, &perr) || perr.Code != "charge_request_mismatch" {
 		t.Fatalf("expected charge_request_mismatch for lying amount, got %v", err)
@@ -63,7 +127,10 @@ func TestVerifyRejectsLyingAcceptedRecipient(t *testing.T) {
 	a := bindingAdapter(t)
 	gate := paykit.Gate{Amount: paykit.MustParseUSD("0.10")}
 
-	route := a.routeAccepts(&gate)
+	route, err := a.routeAccepts(&gate)
+	if err != nil {
+		t.Fatal(err)
+	}
 	tampered := route
 	tampered.PayTo = string(signer.Generate().Pubkey())
 
@@ -72,7 +139,7 @@ func TestVerifyRejectsLyingAcceptedRecipient(t *testing.T) {
 		Payload:     proto.CredentialPayload{Transaction: base64.StdEncoding.EncodeToString([]byte("ignored"))},
 		Accepted:    &tampered,
 	}
-	_, err := a.VerifyAndSettle(&paykit.AdapterRequest{Gate: &gate, PaymentSig: encodeCredential(t, cred)})
+	_, err = a.VerifyAndSettle(&paykit.AdapterRequest{Gate: &gate, PaymentSig: encodeCredential(t, cred)})
 	var perr *paykit.PaymentError
 	if !errors.As(err, &perr) || perr.Code != "charge_request_mismatch" {
 		t.Fatalf("expected charge_request_mismatch for lying recipient, got %v", err)
@@ -109,6 +176,7 @@ func TestCosignRefusesOperatorOutsideFeePayerSlot(t *testing.T) {
 	tx := &solana.Transaction{
 		Message: solana.Message{
 			AccountKeys: solana.PublicKeySlice{feePayer, other, opPub},
+			Header:      solana.MessageHeader{NumRequiredSignatures: 3},
 		},
 		// Three signature slots, all zero: slot 0 (fee payer), slot 1, slot 2
 		// (the operator). A pre-fix cosign would fill slot 2.
@@ -149,6 +217,7 @@ func TestCosignSignsFeePayerSlotZero(t *testing.T) {
 	tx := &solana.Transaction{
 		Message: solana.Message{
 			AccountKeys: solana.PublicKeySlice{opPub, other},
+			Header:      solana.MessageHeader{NumRequiredSignatures: 2},
 		},
 		// Slot 0 (operator/fee payer) zero; slot 1 already carries a client
 		// signature that must be preserved.
@@ -185,7 +254,7 @@ func TestCosignSkipsAlreadyFilledFeePayerSlot(t *testing.T) {
 	}
 	filled := solana.MustSignatureFromBase58(sampleClientSig)
 	tx := &solana.Transaction{
-		Message:    solana.Message{AccountKeys: solana.PublicKeySlice{opPub}},
+		Message:    solana.Message{AccountKeys: solana.PublicKeySlice{opPub}, Header: solana.MessageHeader{NumRequiredSignatures: 1}},
 		Signatures: []solana.Signature{filled},
 	}
 	rawTx, err := tx.MarshalBinary()
@@ -218,7 +287,10 @@ func TestCosignRejectsWideSignerVector(t *testing.T) {
 		keys[i] = solana.NewWallet().PublicKey()
 	}
 	sigs := make([]solana.Signature, 128) // slot 0 zero, operator is fee payer.
-	tx := &solana.Transaction{Message: solana.Message{AccountKeys: keys}, Signatures: sigs}
+	tx := &solana.Transaction{
+		Message:    solana.Message{AccountKeys: keys, Header: solana.MessageHeader{NumRequiredSignatures: 128}},
+		Signatures: sigs,
+	}
 	rawTx, err := tx.MarshalBinary()
 	if err != nil {
 		t.Fatal(err)
@@ -228,17 +300,68 @@ func TestCosignRejectsWideSignerVector(t *testing.T) {
 	}
 }
 
+func TestCosignRejectsSignerVectorMismatchedWithMessage(t *testing.T) {
+	op := signer.Generate()
+	opPub := solana.MustPublicKeyFromBase58(string(op.Pubkey()))
+	a := &Adapter{
+		cfg:    paykit.Config{Network: paykit.SolanaMainnet, Operator: paykit.Operator{Signer: op, Recipient: op.Pubkey()}, X402: paykit.X402Config{Scheme: "exact"}},
+		signer: op,
+	}
+	tx := &solana.Transaction{
+		Message: solana.Message{
+			AccountKeys: solana.PublicKeySlice{opPub},
+			Header:      solana.MessageHeader{NumRequiredSignatures: 1},
+		},
+	}
+	rawTx, err := tx.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.cosign(context.Background(), tx, rawTx); err == nil {
+		t.Fatal("cosign must reject an in-memory transaction whose signature vector does not match the message")
+	}
+}
+
+func TestCosignRejectsReadOnlyFeePayer(t *testing.T) {
+	op := signer.Generate()
+	opPub := solana.MustPublicKeyFromBase58(string(op.Pubkey()))
+	a := &Adapter{
+		cfg:    paykit.Config{Network: paykit.SolanaMainnet, Operator: paykit.Operator{Signer: op, Recipient: op.Pubkey()}, X402: paykit.X402Config{Scheme: "exact"}},
+		signer: op,
+	}
+	tx := &solana.Transaction{
+		Message: solana.Message{
+			AccountKeys: solana.PublicKeySlice{opPub},
+			Header: solana.MessageHeader{
+				NumRequiredSignatures:     1,
+				NumReadonlySignedAccounts: 1,
+			},
+		},
+		Signatures: []solana.Signature{{}},
+	}
+	rawTx, err := tx.MarshalBinary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.cosign(context.Background(), tx, rawTx); err == nil {
+		t.Fatal("cosign must reject a read-only fee payer")
+	}
+}
+
 func TestVerifyAcceptsHonestAcceptedThenProceeds(t *testing.T) {
 	a := bindingAdapter(t)
 	gate := paykit.Gate{Amount: paykit.MustParseUSD("0.10")}
 
-	honest := a.routeAccepts(&gate)
+	honest, err := a.routeAccepts(&gate)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cred := proto.Credential{
 		X402Version: proto.X402Version,
 		Payload:     proto.CredentialPayload{Transaction: base64.StdEncoding.EncodeToString([]byte("not-a-tx"))},
 		Accepted:    &honest,
 	}
-	_, err := a.VerifyAndSettle(&paykit.AdapterRequest{Gate: &gate, PaymentSig: encodeCredential(t, cred)})
+	_, err = a.VerifyAndSettle(&paykit.AdapterRequest{Gate: &gate, PaymentSig: encodeCredential(t, cred)})
 	var perr *paykit.PaymentError
 	if !errors.As(err, &perr) {
 		t.Fatalf("expected a PaymentError, got %v", err)

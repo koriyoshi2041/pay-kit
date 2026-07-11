@@ -2,12 +2,22 @@ import type { Store } from 'mppx';
 
 /** Replay store capability required by x402's reserve-before-settle lifecycle. */
 export interface ReservingReplayStore extends Store.Store {
+    /** Alternative capability name for a durable shared backend. */
+    readonly isDurable?: boolean;
+    /** Explicitly affirm that reservations survive restarts and span replicas. */
+    readonly isShared?: boolean;
     reserve(key: string, value?: unknown, ttlSeconds?: number): Promise<boolean>;
 }
 
 /** Whether a store provides an atomic reserve operation. */
 export function isReservingReplayStore(store: Store.Store): store is ReservingReplayStore {
     return typeof (store as Partial<ReservingReplayStore>).reserve === 'function';
+}
+
+/** Whether a replay store has declared a production-safe shared/durable backend. */
+export function isProductionReplayStore(store: Store.Store): boolean {
+    const candidate = store as Partial<ReservingReplayStore>;
+    return candidate.isShared === true && candidate.isDurable === true;
 }
 
 /**
@@ -36,6 +46,8 @@ export function createMemoryReplayStore(): ReservingReplayStore {
         get(key: string) {
             return Promise.resolve(live(key)?.value ?? null);
         },
+        isDurable: false,
+        isShared: false,
         put(key: string, value: unknown): Promise<void> {
             entries.set(key, { value });
             return Promise.resolve();

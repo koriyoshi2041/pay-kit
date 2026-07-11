@@ -738,27 +738,25 @@ impl X402 {
             .map_err(|e| Error::Other(format!("fee payer signing failed: {e}")))?;
         tx.signatures[signer_index] = Signature::from(<[u8; 64]>::from(signature));
 
-        // Broadcast, then reserve, then confirm — mirroring the MPP charge
-        // order. Broadcast relies on the node's preflight simulation
-        // (skip_preflight stays off) instead of a separate simulate round-trip;
-        // on failure the returned error carries the simulation error + program
-        // logs. The reservation sits between broadcast and confirmation so that
-        // if the confirm poll times out after the transaction has already
-        // landed, the resolved fee-payer signature is still consumed and a
-        // retry of the same envelope cannot trigger a second broadcast. The
-        // pull path shares the `x402-svm-exact:consumed:` keyspace with the
-        // push (Signature) path, so one on-chain settlement is single-use
-        // regardless of which arm presented it.
+        // The fee-payer signature is deterministic once the sponsor has
+        // co-signed the client transaction, so reserve it before any RPC send.
+        // This closes the concurrent replay window: only the atomic store
+        // winner may broadcast the transaction. The pull path shares the
+        // `x402-svm-exact:consumed:` keyspace with the push (Signature) path,
+        // so one on-chain settlement is single-use regardless of which arm
+        // presented it.
+        let signature = tx.signatures[signer_index].to_string();
+        self.consume_signature(&signature).await?;
+
+        // Broadcast relies on the node's preflight simulation (skip_preflight
+        // stays off) instead of a separate simulate round-trip. Once the
+        // reservation is claimed, every send error is treated as ambiguous:
+        // the RPC may have accepted the transaction before the response was
+        // lost, so the marker is deliberately retained and never released here.
         let broadcast_sig = self
             .rpc
             .send_transaction(&tx)
             .map_err(|e| Error::Rpc(format!("exact settlement broadcast failed: {e}")))?;
-        let signature = broadcast_sig.to_string();
-
-        // Reserve immediately after a successful broadcast. A replay of the
-        // same credential (same resolved signature) is rejected here before it
-        // can re-broadcast.
-        self.consume_signature(&signature).await?;
 
         // Confirm to the settled (`confirmed`) commitment. On a confirmation
         // timeout the reservation is KEPT unless the transaction is provably
@@ -2288,9 +2286,9 @@ mod tests {
     // the operator co-signs as fee payer. Without a consumed-signature
     // reservation, the same envelope re-submitted after settlement re-broadcasts
     // and serves again — one payment serves unlimited requests. These tests pin
-    // the reservation: it is taken between broadcast and confirmation, keyed on
-    // the resolved fee-payer signature, in the same `x402-svm-exact:consumed:`
-    // keyspace the Signature (push) arm uses.
+    // the reservation: it is taken before broadcast, keyed on the resolved
+    // fee-payer signature, in the same `x402-svm-exact:consumed:` keyspace the
+    // Signature (push) arm uses.
 
     /// A bare, clonable transfer transaction with the fee payer at index 0 and a
     /// single (empty) signature slot for the operator to fill. Built with a
@@ -2328,6 +2326,78 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::SignatureConsumed), "got: {err:?}");
+        assert_eq!(
+            mock.send_count(),
+            1,
+            "replay must not trigger a second send"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn settle_exact_pull_retains_reservation_on_broadcast_error() {
+        // A send error is ambiguous to the caller: the RPC may have accepted
+        // the transaction before the response failed. Retain the claim so a
+        // retry cannot submit the same signed transaction a second time.
+        let mock = MockRpc::start();
+        mock.fail_send("connection reset after acceptance");
+        let x402 = handler_with_rpc(mock.url());
+        let fee_payer = memory_signer(24);
+        let tx = transfer_tx(fee_payer.pubkey(), Pubkey::new_unique());
+
+        let first = x402
+            .settle_exact(VerifiedExactPayment::Transaction(tx.clone()), &fee_payer)
+            .await;
+        assert!(matches!(first, Err(Error::Rpc(_))), "got: {first:?}");
+
+        let second = x402
+            .settle_exact(VerifiedExactPayment::Transaction(tx), &fee_payer)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(second, Error::SignatureConsumed),
+            "got: {second:?}"
+        );
+        assert_eq!(mock.send_count(), 1, "ambiguous retry must not send again");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settle_exact_pull_concurrent_replay_sends_at_most_once() {
+        const TASKS: usize = 16;
+
+        let mock = MockRpc::start();
+        let x402 = Arc::new(handler_with_rpc(mock.url()));
+        let fee_payer = Arc::new(memory_signer(25));
+        let tx = transfer_tx(fee_payer.pubkey(), Pubkey::new_unique());
+        let barrier = Arc::new(tokio::sync::Barrier::new(TASKS));
+
+        let mut handles = Vec::with_capacity(TASKS);
+        for _ in 0..TASKS {
+            let x402 = x402.clone();
+            let fee_payer = fee_payer.clone();
+            let tx = tx.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                x402.settle_exact(VerifiedExactPayment::Transaction(tx), fee_payer.as_ref())
+                    .await
+            }));
+        }
+
+        let mut winners = 0usize;
+        for handle in handles {
+            match handle.await.expect("task panicked") {
+                Ok(_) => winners += 1,
+                Err(Error::SignatureConsumed) => {}
+                Err(error) => panic!("unexpected concurrent settlement error: {error:?}"),
+            }
+        }
+
+        assert_eq!(winners, 1, "exactly one concurrent settlement may succeed");
+        assert_eq!(
+            mock.send_count(),
+            1,
+            "concurrent replay must send at most once"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

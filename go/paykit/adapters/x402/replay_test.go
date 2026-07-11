@@ -60,7 +60,7 @@ func exactCredential(t *testing.T, op paykit.Signer) string {
 		t.Fatal(err)
 	}
 	computeBudget := solana.MustPublicKeyFromBase58(proto.ComputeBudgetProgram)
-	keys := solana.PublicKeySlice{opPub, source, mint, dest, authority, computeBudget, tokenProgram}
+	keys := solana.PublicKeySlice{opPub, authority, source, mint, dest, computeBudget, tokenProgram}
 	const amount = uint64(1000)
 	priceData := make([]byte, 9)
 	priceData[0] = 3
@@ -72,10 +72,11 @@ func exactCredential(t *testing.T, op paykit.Signer) string {
 	tx := &solana.Transaction{
 		Message: solana.Message{
 			AccountKeys: keys,
+			Header:      solana.MessageHeader{NumRequiredSignatures: 2},
 			Instructions: []solana.CompiledInstruction{
 				{ProgramIDIndex: 5, Data: []byte{2, 0, 0, 0, 0}},
 				{ProgramIDIndex: 5, Data: priceData},
-				{ProgramIDIndex: 6, Accounts: []uint16{1, 2, 3, 4}, Data: transferData},
+				{ProgramIDIndex: 6, Accounts: []uint16{2, 3, 4, 1}, Data: transferData},
 			},
 		},
 		Signatures: []solana.Signature{{}, solana.MustSignatureFromBase58(sampleClientSig)},
@@ -522,8 +523,18 @@ func TestNonLocalnetRequiresSharedReplayStore(t *testing.T) {
 	}
 
 	cfg.X402.ReplayStore = mppcore.NewMemoryStore()
+	if _, err := New(cfg); err == nil {
+		t.Fatal("expected a process-local replay store to fail closed outside localnet")
+	}
+
+	cfg.X402.ReplayStore = declaredReplayStore{Store: mppcore.NewMemoryStore()}
+	if _, err := New(cfg); err == nil {
+		t.Fatal("expected a store that reports non-durable replay protection to fail closed outside localnet")
+	}
+
+	cfg.X402.ReplayStore = declaredReplayStore{Store: mppcore.NewMemoryStore(), durable: true}
 	if _, err := New(cfg); err != nil {
-		t.Fatalf("injected atomic store should be accepted: %v", err)
+		t.Fatalf("injected store declaring durable shared replay protection should be accepted: %v", err)
 	}
 }
 
@@ -536,3 +547,13 @@ func TestNonLocalnetInsecureMemoryOptIn(t *testing.T) {
 		t.Fatalf("explicit insecure development opt-in should permit memory store: %v", err)
 	}
 }
+
+// declaredReplayStore is a test double for an externally backed store.
+// The embedded MemoryStore supplies behavior; the capability declaration is
+// what New requires from a production implementation outside localnet.
+type declaredReplayStore struct {
+	mppcore.Store
+	durable bool
+}
+
+func (s declaredReplayStore) ProvidesDurableSharedReplayProtection() bool { return s.durable }

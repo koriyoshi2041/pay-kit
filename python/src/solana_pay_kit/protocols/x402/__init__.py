@@ -260,6 +260,15 @@ class X402Adapter:
 
         # Cosign as the facilitator fee payer (slot-splice, version aware).
         cosigned_wire = _co_sign(tx_base64, signer)
+        # The RPC response is not available until after the broadcast. Derive
+        # the transaction's fee-payer signature from the final wire so the
+        # replay fence can close the race before any network side effect.
+        replay_signature = _transaction_signature(cosigned_wire)
+        # Keep x402 markers separate from MPP charge markers so one protocol's
+        # credential can never satisfy the other protocol's replay check.
+        replay_key = _REPLAY_PREFIX + replay_signature
+        if not await self._store.put_if_absent(replay_key, True):
+            raise InvalidProofError("solana_pay_kit: signature_consumed", code="signature_consumed")
 
         rpc = SolanaRpc(rpc_url)
         try:
@@ -273,14 +282,6 @@ class X402Adapter:
             if not signature:
                 raise InvalidProofError("solana_pay_kit: empty broadcast result", code="payment_invalid")
 
-            # Replay reservation. Namespace is distinct from the MPP charge key
-            # so an x402 signature can never satisfy an MPP route and vice
-            # versa. Reserve BEFORE confirmation so a concurrent resubmit of the
-            # same signature loses the race and is rejected as consumed.
-            replay_key = _REPLAY_PREFIX + signature
-            if not await self._store.put_if_absent(replay_key, True):
-                raise InvalidProofError("solana_pay_kit: signature_consumed", code="signature_consumed")
-
             # Await on-chain confirmation BEFORE returning success. Without this
             # the adapter returned a settlement header for a transaction that
             # may have been dropped by the cluster or reverted on-chain, granting
@@ -288,13 +289,10 @@ class X402Adapter:
             # ``transaction-failed`` (included but reverted) or
             # ``transaction-not-found`` (never confirmed inside the window).
             #
-            # Once broadcast succeeds, confirmation errors are not proof that
-            # the transaction failed to land. A timeout may confirm later, and
-            # an on-chain failure still consumed the transaction's signature.
-            # Keep the atomic reservation for every post-broadcast outcome;
-            # Python has no blockhash-expiry/status combination here that can
-            # prove the transaction will never land. Pre-broadcast failures do
-            # not need rollback because the reservation has not been created.
+            # Once the reservation is created, keep it for every broadcast or
+            # confirmation outcome. A send error is ambiguous: the node may
+            # have accepted the transaction before the connection failed, and a
+            # timeout may confirm later. Retrying could therefore double-send.
             try:
                 await rpc.await_confirmation(signature)
             except Exception as exc:  # noqa: BLE001
@@ -503,6 +501,35 @@ def _co_sign(transaction_b64: str, signer: Any) -> bytes:
     sig_start = 1 + idx * 64
     serialized[sig_start : sig_start + 64] = sig_bytes
     return bytes(serialized)
+
+
+def _transaction_signature(transaction_wire: bytes) -> str:
+    """Extract the fee-payer signature from a signed legacy or v0 wire."""
+    from solders.signature import Signature
+    from solders.transaction import Transaction, VersionedTransaction
+
+    from solana_pay_kit._paycore.transaction import is_v0_wire_bytes
+
+    try:
+        if is_v0_wire_bytes(transaction_wire):
+            signatures = list(VersionedTransaction.from_bytes(transaction_wire).signatures)
+        else:
+            try:
+                signatures = list(Transaction.from_bytes(transaction_wire).signatures)
+            except Exception:
+                signatures = list(VersionedTransaction.from_bytes(transaction_wire).signatures)
+    except Exception as exc:  # noqa: BLE001 - the verifier already checked the payload
+        raise InvalidProofError(
+            "invalid_exact_svm_payload_transaction_parse",
+            code="invalid_exact_svm_payload_transaction_parse",
+        ) from exc
+
+    if not signatures or signatures[0] == Signature.default():
+        raise InvalidProofError(
+            "solana_pay_kit: transaction is missing its fee-payer signature",
+            code="payment_invalid",
+        )
+    return str(signatures[0])
 
 
 def _recent_blockhash_of(transaction_b64: str) -> str | None:

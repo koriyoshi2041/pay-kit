@@ -182,4 +182,97 @@ describe('payment-header size cap enforced by the adapters', () => {
         await adapter.verifyAndSettle(gate, request);
         expect(decodeSpy).toHaveBeenCalledWith(atCap);
     });
+
+    it('rejects one channel across independent upto engines sharing the atomic store', async () => {
+        vi.useFakeTimers({ now: 1_700_000_000_000 });
+        try {
+            const config = await payKitConfig();
+            const first = new X402Upto(config);
+            const second = new X402Upto(config);
+            decodeSpy.mockReturnValue({
+                accepted: { network: 'solana:test' },
+                payload: { channelId: 'shared-channel', expiresAt: 1_700_003_600, from: 'payer' },
+            });
+            const request = new Request('http://localhost/meter', { headers: { 'x-payment': 'credential' } });
+
+            await expect(first.verifyOpen(request, usd('1.00'))).resolves.toMatchObject({
+                maxBaseUnits: 1_000_000n,
+            });
+            vi.advanceTimersByTime(301_000);
+            await expect(second.verifyOpen(request, usd('1.00'))).rejects.toMatchObject({
+                code: 'upto_channel_replayed',
+            });
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it('accepts independent channels on independent usage routes', async () => {
+        const config = await payKitConfig();
+        const first = new X402Upto(config);
+        const second = new X402Upto(config);
+
+        decodeSpy
+            .mockReturnValueOnce({
+                accepted: { network: 'solana:test' },
+                payload: { channelId: 'route-a-channel', expiresAt: 1_700_003_600, from: 'payer' },
+            })
+            .mockReturnValueOnce({
+                accepted: { network: 'solana:test' },
+                payload: { channelId: 'route-b-channel', expiresAt: 1_700_003_600, from: 'payer' },
+            });
+
+        await expect(
+            first.verifyOpen(
+                new Request('http://localhost/usage/a', { headers: { 'x-payment': 'credential-a' } }),
+                usd('1.00'),
+            ),
+        ).resolves.toBeDefined();
+        await expect(
+            second.verifyOpen(
+                new Request('http://localhost/usage/b', { headers: { 'x-payment': 'credential-b' } }),
+                usd('1.00'),
+            ),
+        ).resolves.toBeDefined();
+    });
+
+    it('binds a verified channel to one replay route, not the whole engine', async () => {
+        const config = await payKitConfig();
+        const first = new X402Upto(config);
+        const second = new X402Upto(config);
+        decodeSpy.mockReturnValue({
+            accepted: { network: 'solana:test' },
+            payload: { channelId: 'same-channel', expiresAt: 1_700_003_600, from: 'payer' },
+        });
+
+        await first.verifyOpen(
+            new Request('http://localhost/usage/a', { headers: { 'x-payment': 'credential' } }),
+            usd('1.00'),
+        );
+        const request = new Request('http://localhost/usage/b', { headers: { 'x-payment': 'credential' } });
+
+        await expect(second.verifyOpen(request, usd('1.00'))).rejects.toMatchObject({
+            code: 'upto_route_mismatch',
+        });
+    });
+
+    it('does not claim that the current upto wire binds the challenge route', async () => {
+        const config = await payKitConfig();
+        const upto = new X402Upto(config);
+        decodeSpy.mockReturnValue({
+            accepted: { network: 'solana:test' },
+            payload: { channelId: 'unbound-route-channel', expiresAt: 1_700_003_600, from: 'payer' },
+        });
+
+        // `accepts()` only describes the challenge. The upstream payload has
+        // no signed resource pathname, so a credential created from that
+        // challenge cannot be checked against `/usage/a` here.
+        await upto.accepts(usd('1.00'), new Request('http://localhost/usage/a'));
+        await expect(
+            upto.verifyOpen(
+                new Request('http://localhost/usage/b', { headers: { 'x-payment': 'credential' } }),
+                usd('1.00'),
+            ),
+        ).resolves.toBeDefined();
+    });
 });

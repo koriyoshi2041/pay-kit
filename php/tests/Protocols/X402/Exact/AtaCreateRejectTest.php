@@ -39,23 +39,30 @@ final class AtaCreateRejectTest extends TestCase
      * return [base64, requirement].
      *
      * @param list<array{program:string,data:string,accounts:list<string>}> $optionals
+     * @param list<string> $signerTail
      * @return array{0:string,1:array<string,mixed>}
      */
-    private function buildTransaction(array $optionals): array
-    {
+    private function buildTransaction(
+        array $optionals,
+        ?string $source = null,
+        ?string $authority = null,
+        array $signerTail = [],
+        string $tokenProgram = self::TOKEN_PROGRAM,
+        string $amount = '100000',
+        ?string $amountWire = null,
+    ): array {
         $payer     = Keypair::generate()->getPublicKey()->toBase58();
-        $authority = Keypair::generate()->getPublicKey()->toBase58();
-        $source    = Keypair::generate()->getPublicKey()->toBase58();
+        $authority ??= Keypair::generate()->getPublicKey()->toBase58();
+        $source ??= Keypair::generate()->getPublicKey()->toBase58();
         $payTo     = Keypair::generate()->getPublicKey()->toBase58();
         $mint      = self::USDC_MINT;
-        $tokenProgram = self::TOKEN_PROGRAM;
         $destination  = Mints::deriveAta($payTo, $mint, $tokenProgram);
-        $amount = 100000;
+        $amountWire ??= pack('P', (int) $amount);
 
         // Instruction data blobs.
         $computeLimitData = chr(2) . pack('V', 200000);            // tag 2 + u32
         $computePriceData = chr(3) . pack('P', 1);                 // tag 3 + u64
-        $transferData     = chr(12) . pack('P', $amount) . chr(6); // tag 12 + u64 + u8 decimals
+        $transferData     = chr(12) . $amountWire . chr(6);        // tag 12 + u64 + u8 decimals
 
         // Build the ordered account-key table and an index resolver.
         $keys = [];
@@ -81,7 +88,10 @@ final class AtaCreateRejectTest extends TestCase
         );
         $instructions[] = new CompiledInstructionV0(
             $indexOf($tokenProgram),
-            [$indexOf($source), $indexOf($mint), $indexOf($destination), $indexOf($authority)],
+            array_map(
+                $indexOf,
+                array_merge([$source, $mint, $destination, $authority], $signerTail),
+            ),
             $transferData,
         );
         foreach ($optionals as $opt) {
@@ -125,13 +135,28 @@ final class AtaCreateRejectTest extends TestCase
         return [base64_encode($wire), $requirement];
     }
 
+    private function unrelatedManagedSigner(): string
+    {
+        return Keypair::generate()->getPublicKey()->toBase58();
+    }
+
     public function testTransactionWithoutOptionalsVerifies(): void
     {
         [$tx, $req] = $this->buildTransaction([]);
-        $result = Verifier::verify($tx, $req, ['someFacilitatorPubkeyThatIsNotInTx']);
+        $result = Verifier::verify($tx, $req, [$this->unrelatedManagedSigner()]);
         $this->assertSame(self::TOKEN_PROGRAM, $result['program']);
         $this->assertSame('100000', $result['amount']);
         $this->assertArrayNotHasKey('destinationCreateAta', $result);
+    }
+
+    public function testUnsignedU64MaxAmountVerifiesThroughFullWirePath(): void
+    {
+        $max = '18446744073709551615';
+        [$tx, $req] = $this->buildTransaction([], amount: $max, amountWire: str_repeat("\xff", 8));
+
+        $result = Verifier::verify($tx, $req, [$this->unrelatedManagedSigner()]);
+
+        $this->assertSame($max, $result['amount']);
     }
 
     public function testLighthouseOptionalInstructionAccepted(): void
@@ -142,7 +167,7 @@ final class AtaCreateRejectTest extends TestCase
             ['program' => self::LIGHTHOUSE, 'data' => chr(0), 'accounts' => []],
             ['program' => self::LIGHTHOUSE, 'data' => chr(0), 'accounts' => []],
         ]);
-        $result = Verifier::verify($tx, $req, ['someFacilitatorPubkeyThatIsNotInTx']);
+        $result = Verifier::verify($tx, $req, [$this->unrelatedManagedSigner()]);
         $this->assertSame('100000', $result['amount']);
     }
 
@@ -151,7 +176,7 @@ final class AtaCreateRejectTest extends TestCase
         [$tx, $req] = $this->buildTransaction([
             ['program' => self::MEMO_PROGRAM, 'data' => 'abc123nonce', 'accounts' => []],
         ]);
-        $result = Verifier::verify($tx, $req, ['someFacilitatorPubkeyThatIsNotInTx']);
+        $result = Verifier::verify($tx, $req, [$this->unrelatedManagedSigner()]);
         $this->assertSame('100000', $result['amount']);
     }
 
@@ -166,10 +191,54 @@ final class AtaCreateRejectTest extends TestCase
         [$tx, $req] = $this->buildTransaction([]);
         unset($req['extra']['tokenProgram']);
 
-        $result = Verifier::verify($tx, $req, ['someFacilitatorPubkeyThatIsNotInTx']);
+        $result = Verifier::verify($tx, $req, [$this->unrelatedManagedSigner()]);
 
         $this->assertSame(self::TOKEN_PROGRAM, $result['program']);
         $this->assertSame('100000', $result['amount']);
+    }
+
+    public function testManagedSignerAsDirectSourceRejected(): void
+    {
+        $managed = Keypair::generate()->getPublicKey()->toBase58();
+        [$tx, $req] = $this->buildTransaction([], source: $managed);
+
+        $this->expectException(InvalidProofException::class);
+        $this->expectExceptionMessage(
+            'invalid_exact_svm_payload_transaction_fee_payer_transferring_funds',
+        );
+        Verifier::verify($tx, $req, [$managed]);
+    }
+
+    public function testManagedSourceAtaForActualToken2022ProgramRejected(): void
+    {
+        $managed = Keypair::generate()->getPublicKey()->toBase58();
+        $source = Mints::deriveAta($managed, self::USDC_MINT, Verifier::TOKEN_2022_PROGRAM);
+        [$tx, $req] = $this->buildTransaction(
+            [],
+            source: $source,
+            tokenProgram: Verifier::TOKEN_2022_PROGRAM,
+        );
+        // The transfer instruction's program is authoritative even if an
+        // offer pins the legacy Token program in extra.tokenProgram.
+        $req['extra']['tokenProgram'] = self::TOKEN_PROGRAM;
+
+        $this->expectException(InvalidProofException::class);
+        $this->expectExceptionMessage(
+            'invalid_exact_svm_payload_transaction_fee_payer_transferring_funds',
+        );
+        Verifier::verify($tx, $req, [$managed]);
+    }
+
+    public function testManagedSignerInTransferCheckedSignerTailRejected(): void
+    {
+        $managed = Keypair::generate()->getPublicKey()->toBase58();
+        [$tx, $req] = $this->buildTransaction([], signerTail: [$managed]);
+
+        $this->expectException(InvalidProofException::class);
+        $this->expectExceptionMessage(
+            'invalid_exact_svm_payload_transaction_fee_payer_transferring_funds',
+        );
+        Verifier::verify($tx, $req, [$managed]);
     }
 
     public function testAtaCreateOptionalInstructionRejected(): void
@@ -192,6 +261,6 @@ final class AtaCreateRejectTest extends TestCase
         ]);
         $this->expectException(InvalidProofException::class);
         $this->expectExceptionMessageMatches('/unknown_fourth_instruction/');
-        Verifier::verify($tx, $req, ['someFacilitatorPubkeyThatIsNotInTx']);
+        Verifier::verify($tx, $req, [$this->unrelatedManagedSigner()]);
     }
 }

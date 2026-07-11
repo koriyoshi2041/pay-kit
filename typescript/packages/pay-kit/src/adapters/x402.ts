@@ -109,11 +109,11 @@ export function createX402ExactAdapter(config: PayKitConfig): ProtocolAdapter {
     }
 
     /** The route's pinned requirements — the credential is bound to this exact amount. */
-    function requirementsFor(gate: Gate): PaymentRequirements {
+    function requirementsFor(gate: Gate, request: Request): PaymentRequirements {
         return {
             amount: gate.total().baseUnits().toString(),
             asset: mintFor(gate),
-            extra: { feePayer: operator },
+            extra: { feePayer: operator, memo: new URL(request.url).pathname },
             maxTimeoutSeconds: MAX_TIMEOUT_SECONDS,
             network,
             payTo: gate.payTo,
@@ -127,8 +127,8 @@ export function createX402ExactAdapter(config: PayKitConfig): ProtocolAdapter {
      * round-trip (mirroring MPP's `recentBlockhash`). Falls back to the bare
      * requirements if the fetch fails (the client then fetches its own).
      */
-    async function challengeRequirements(gate: Gate): Promise<PaymentRequirements> {
-        const base = requirementsFor(gate);
+    async function challengeRequirements(gate: Gate, request: Request): Promise<PaymentRequirements> {
+        const base = requirementsFor(gate, request);
         const cached = await blockhashCache.recentBlockhash(config.rpcUrl);
         if (cached === undefined) return base;
         return {
@@ -142,14 +142,14 @@ export function createX402ExactAdapter(config: PayKitConfig): ProtocolAdapter {
     }
 
     return {
-        acceptsEntry(gate: Gate): Promise<AcceptsEntry> {
-            const requirements = requirementsFor(gate);
+        acceptsEntry(gate: Gate, request: Request): Promise<AcceptsEntry> {
+            const requirements = requirementsFor(gate, request);
             return Promise.resolve({ ...requirements, protocol: 'x402' });
         },
 
         async challengeHeaders(gate: Gate, request: Request): Promise<Readonly<Record<string, string>>> {
             const paymentRequired: PaymentRequired = {
-                accepts: [await challengeRequirements(gate)],
+                accepts: [await challengeRequirements(gate, request)],
                 resource: { url: new URL(request.url).pathname },
                 x402Version: X402_VERSION,
             };
@@ -175,7 +175,7 @@ export function createX402ExactAdapter(config: PayKitConfig): ProtocolAdapter {
                 throw new InvalidProofError('invalid_x402_payment_header', errorMessage(error));
             }
 
-            const requirements = requirementsFor(gate);
+            const requirements = requirementsFor(gate, request);
             const verification = await facilitator.verify(payload, requirements);
             if (!verification.isValid) {
                 throw new InvalidProofError(verification.invalidReason ?? 'invalid_proof', verification.invalidMessage);

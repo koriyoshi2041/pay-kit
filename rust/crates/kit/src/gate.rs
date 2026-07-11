@@ -130,6 +130,9 @@ impl Default for PayKitConfig {
 pub struct PayKit {
     mpp: Arc<Mpp>,
     x402: Arc<X402>,
+    /// Fee-payer signer used to settle x402 exact pull transactions before
+    /// the gated handler is allowed to run.
+    x402_fee_payer_signer: Option<Arc<dyn SolanaSigner>>,
     /// Usage-based x402 `upto` handler. `Some` only when `fee_payer_signer` is
     /// set — the operator must sign settlement vouchers, so `upto` routes
     /// require a signer.
@@ -252,6 +255,7 @@ impl PayKit {
         Ok(Self {
             mpp: Arc::new(mpp),
             x402: Arc::new(x402),
+            x402_fee_payer_signer: config.fee_payer_signer,
             x402_upto,
             x402_batch,
         })
@@ -557,21 +561,6 @@ fn attach_mpp_receipt(resp: &mut Response, receipt: &Receipt) {
     }
 }
 
-/// Extract a settlement reference from a verified x402 payment. Returns `None`
-/// when the transaction carries no signature (an unsigned tx), so the gate can
-/// reject rather than hand the handler an empty reference.
-fn x402_reference(verified: &VerifiedExactPayment) -> Option<String> {
-    let reference = match verified {
-        VerifiedExactPayment::Signature(sig) => sig.clone(),
-        VerifiedExactPayment::Transaction(tx) => tx
-            .signatures
-            .first()
-            .map(|s| s.to_string())
-            .unwrap_or_default(),
-    };
-    (!reference.is_empty()).then_some(reference)
-}
-
 fn attach_x402_response(resp: &mut Response, reference: &str) {
     if let (Ok(n), Ok(v)) = (
         HeaderName::from_bytes(PAYMENT_RESPONSE_HEADER.as_bytes()),
@@ -647,25 +636,48 @@ async fn gate_middleware(State(state): State<GateState>, mut req: Request, next:
             )
             .await
         {
-            Ok(verified) => match x402_reference(&verified) {
-                Some(reference) => {
-                    req.extensions_mut().insert(Payment {
-                        amount,
-                        protocol: Protocol::X402,
-                        reference: reference.clone(),
-                    });
-                    let mut resp = next.run(req).await;
-                    attach_x402_response(&mut resp, &reference);
-                    resp
+            Ok(verified) => {
+                let reference = match verified {
+                    // Signature proofs have already been confirmed and
+                    // atomically consumed by `process_payment`.
+                    VerifiedExactPayment::Signature(reference) => Ok(reference),
+                    // Pull proofs are only verified at this point. They must
+                    // be co-signed, broadcast, and confirmed before access.
+                    VerifiedExactPayment::Transaction(transaction) => {
+                        match state.pay.x402_fee_payer_signer.as_ref() {
+                            Some(fee_payer) => state
+                                .pay
+                                .x402
+                                .settle_exact(
+                                    VerifiedExactPayment::Transaction(transaction),
+                                    fee_payer.as_ref(),
+                                )
+                                .await
+                                .map_err(|e| e.to_string()),
+                            None => {
+                                Err("x402 pull payment requires a fee-payer signer".to_string())
+                            }
+                        }
+                    }
+                };
+
+                match reference {
+                    Ok(reference) => {
+                        req.extensions_mut().insert(Payment {
+                            amount,
+                            protocol: Protocol::X402,
+                            reference: reference.clone(),
+                        });
+                        let mut resp = next.run(req).await;
+                        attach_x402_response(&mut resp, &reference);
+                        resp
+                    }
+                    Err(error) => {
+                        tracing::warn!(amount = %amount, error, "x402 settlement failed");
+                        challenge_response(&state.pay, &amount, &route_resource)
+                    }
                 }
-                None => {
-                    tracing::warn!(
-                        amount = %amount,
-                        "x402 payment verified but carried no settlement reference"
-                    );
-                    challenge_response(&state.pay, &amount, &route_resource)
-                }
-            },
+            }
             Err(_) => challenge_response(&state.pay, &amount, &route_resource),
         };
     }
@@ -1021,6 +1033,7 @@ mod tests {
     use crate::x402::X402_VERSION_V2;
     use axum::body::Body;
     use axum::Router;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tower::ServiceExt; // oneshot
 
     const TEST_RECIPIENT: &str = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
@@ -1042,6 +1055,17 @@ mod tests {
     }
 
     fn paid_x402_header(pay: &PayKit, resource: &str, amount: &str) -> String {
+        use solana_pubkey::Pubkey;
+
+        paid_x402_header_with_fee_payer(pay, resource, amount, Pubkey::new_unique())
+    }
+
+    fn paid_x402_header_with_fee_payer(
+        pay: &PayKit,
+        resource: &str,
+        amount: &str,
+        fee_payer: solana_pubkey::Pubkey,
+    ) -> String {
         use solana_hash::Hash;
         use solana_instruction::{AccountMeta, Instruction};
         use solana_message::Message;
@@ -1076,7 +1100,6 @@ mod tests {
             &ata_program,
         )
         .0;
-        let fee_payer = Pubkey::new_unique();
         let owner = Pubkey::new_unique();
         let source = Pubkey::find_program_address(
             &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
@@ -1294,9 +1317,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn paid_x402_public_gate_uses_same_route_binding() {
+    async fn paid_x402_unsettled_pull_never_runs_handler() {
         let pay = test_paykit();
         let header = paid_x402_header(&pay, "/r", "0.10");
+        let called = Arc::new(AtomicBool::new(false));
+        let handler_called = called.clone();
+        let handler = move |_payment: Payment| {
+            let handler_called = handler_called.clone();
+            async move {
+                handler_called.store(true, Ordering::SeqCst);
+                "ok"
+            }
+        };
+        let app: Router = Router::new().route("/r", paid_get(handler, "0.10", &pay));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/r")
+                    .header(PAYMENT_SIGNATURE_HEADER, header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paid_x402_pull_settles_before_handler() {
+        let mock = crate::x402::server::mock_rpc::MockRpc::start();
+        let fee_payer = test_signer();
+        let pay = PayKit::new(PayKitConfig {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            network: "devnet".to_string(),
+            rpc_url: Some(mock.url()),
+            fee_payer_signer: Some(fee_payer.clone()),
+            x402_replay_store: Some(Arc::new(MemoryStore::new())),
+            x402_channel_store: Some(Arc::new(MemoryChannelStore::new())),
+            ..Default::default()
+        })
+        .expect("valid paykit config");
+        let header = paid_x402_header_with_fee_payer(&pay, "/r", "0.10", fee_payer.pubkey());
         let app: Router = Router::new().route("/r", paid_get(report, "0.10", &pay));
         let resp = app
             .oneshot(
@@ -1310,6 +1373,46 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().contains_key(PAYMENT_RESPONSE_HEADER));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn paid_x402_settlement_failure_never_runs_handler() {
+        let fee_payer = test_signer();
+        let pay = PayKit::new(PayKitConfig {
+            recipient: TEST_RECIPIENT.to_string(),
+            challenge_binding_secret: Some(TEST_SECRET.to_string()),
+            network: "devnet".to_string(),
+            rpc_url: Some("http://127.0.0.1:1".to_string()),
+            fee_payer_signer: Some(fee_payer.clone()),
+            x402_replay_store: Some(Arc::new(MemoryStore::new())),
+            x402_channel_store: Some(Arc::new(MemoryChannelStore::new())),
+            ..Default::default()
+        })
+        .expect("valid paykit config");
+        let header = paid_x402_header_with_fee_payer(&pay, "/r", "0.10", fee_payer.pubkey());
+        let called = Arc::new(AtomicBool::new(false));
+        let handler_called = called.clone();
+        let handler = move |_payment: Payment| {
+            let handler_called = handler_called.clone();
+            async move {
+                handler_called.store(true, Ordering::SeqCst);
+                "ok"
+            }
+        };
+        let app: Router = Router::new().route("/r", paid_post(handler, "0.10", &pay));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/r")
+                    .header(PAYMENT_SIGNATURE_HEADER, header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+        assert!(!called.load(Ordering::SeqCst));
     }
 
     #[test]

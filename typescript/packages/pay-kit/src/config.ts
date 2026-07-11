@@ -1,10 +1,11 @@
 import { DEFAULT_RPC_URLS } from '@solana/mpp';
+import type { SessionStore } from '@solana/mpp/server';
 import type { Store } from 'mppx';
 
 import { ConfigurationError, DemoSignerOnMainnetError, ProtocolNotSupportedError } from './errors.js';
 import { type Stablecoin, STABLECOINS } from './price.js';
 import { type Network, type NetworkSlug, type Protocol, toNetwork, toSolanaNetwork } from './protocol.js';
-import { createMemoryReplayStore, isReservingReplayStore } from './replay-store.js';
+import { createMemoryReplayStore, isProductionReplayStore, isReservingReplayStore } from './replay-store.js';
 import { type KeychainSigner, type PayKitSigner, Signer } from './signer.js';
 
 /** MPP protocol options. */
@@ -25,6 +26,11 @@ export type MppOptions = {
      */
     readonly html?: boolean;
     readonly realm?: string;
+    /**
+     * Storage for MPP session channels. Provide a durable, shared store in
+     * production because it records voucher and delivery state.
+     */
+    readonly sessionStore?: SessionStore;
 };
 
 /** x402 protocol options. Reserved for future scheme-specific settings. */
@@ -77,6 +83,7 @@ export type PayKitConfig = {
         readonly expiresIn: number;
         readonly html: boolean;
         readonly realm: string;
+        readonly sessionStore: SessionStore | undefined;
     };
     readonly network: Network;
     readonly operator: Operator;
@@ -88,22 +95,33 @@ export type PayKitConfig = {
 };
 
 const DEFAULT_EXPIRES_IN_SECONDS = 120;
+const ALLOW_INMEMORY_REPLAY_STORE_ENV = 'PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE';
 
 function resolveReplayStore(network: Network, provided: Store.Store | undefined, requireAtomic: boolean): Store.Store {
+    const allowInMemory = process.env[ALLOW_INMEMORY_REPLAY_STORE_ENV] === '1';
     if (provided !== undefined) {
         if (requireAtomic && !isReservingReplayStore(provided)) {
             throw new ConfigurationError(
                 'x402 replayStore must provide an atomic reserve(key, value, ttlSeconds) operation.',
             );
         }
+        if (requireAtomic && network !== 'solana_localnet' && !isProductionReplayStore(provided) && !allowInMemory) {
+            throw new ConfigurationError(
+                'x402 replayStore must affirmatively set isShared=true and isDurable=true outside localnet; ' +
+                    `set ${ALLOW_INMEMORY_REPLAY_STORE_ENV}=1 only for explicit single-process development scope`,
+            );
+        }
+        if (requireAtomic && network !== 'solana_localnet' && !isProductionReplayStore(provided)) {
+            console.warn(
+                '[pay-kit] x402 is using a process-local replay store off localnet because ' +
+                    `${ALLOW_INMEMORY_REPLAY_STORE_ENV}=1; replay protection is not shared across replicas.`,
+            );
+        }
         return provided;
     }
-    const allowInMemory = process.env.PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE === '1';
     if (network !== 'solana_localnet' && !allowInMemory) {
         throw new ConfigurationError(
-            'replayStore is required outside localnet. Pass a shared persistent store with an atomic ' +
-                'reserve operation, or set PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1 to acknowledge ' +
-                'single-process replay scope.',
+            `no shared replay store configured outside localnet; provide replayStore or set ${ALLOW_INMEMORY_REPLAY_STORE_ENV}=1`,
         );
     }
     if (network !== 'solana_localnet') {
@@ -206,6 +224,7 @@ export async function configure(params: ConfigureParams = {}): Promise<PayKitCon
             expiresIn,
             html: params.mpp?.html ?? false,
             realm: params.mpp?.realm ?? 'App',
+            sessionStore: params.mpp?.sessionStore,
         }),
         network,
         operator: Object.freeze(operator),

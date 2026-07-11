@@ -140,9 +140,13 @@ func (c *Client) write402(w http.ResponseWriter, r *http.Request, gate *Gate, pe
 	accepts := []AcceptsEntry{}
 	headers := map[string]string{}
 	if c.x402Adapter != nil && containsProtocol(accept, X402) && !gate.HasFees() {
-		accepts = append(accepts, c.x402Adapter.AcceptsEntry(gate))
-		for k, v := range c.x402Adapter.ChallengeHeaders(gate) {
-			headers[k] = v
+		x402Gate := *gate
+		x402Gate.Desc = r.URL.Path
+		if entry := c.x402Adapter.AcceptsEntry(&x402Gate); entry != nil {
+			accepts = append(accepts, entry)
+			for k, v := range c.x402Adapter.ChallengeHeaders(&x402Gate) {
+				headers[k] = v
+			}
 		}
 	}
 	if c.mppAdapter != nil && containsProtocol(accept, MPP) {

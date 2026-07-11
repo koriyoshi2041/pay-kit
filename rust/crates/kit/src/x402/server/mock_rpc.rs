@@ -47,6 +47,8 @@ struct MockState {
     /// When set, `sendTransaction` fails with this JSON-RPC error message
     /// (drives the broadcast-error branch).
     send_error: Option<String>,
+    /// Number of `sendTransaction` requests received by the mock.
+    send_count: usize,
     /// When set, `getAccountInfo` fails with this JSON-RPC error message
     /// (drives the account-fetch-error branch).
     account_error: Option<String>,
@@ -142,6 +144,11 @@ impl MockRpc {
     /// Make `sendTransaction` fail (broadcast-error branch).
     pub fn fail_send(&self, message: &str) {
         self.state.lock().unwrap().send_error = Some(message.to_string());
+    }
+
+    /// Return the number of `sendTransaction` requests received so far.
+    pub fn send_count(&self) -> usize {
+        self.state.lock().unwrap().send_count
     }
 
     /// Make `getAccountInfo` fail (account-fetch-error branch).
@@ -241,7 +248,7 @@ fn dispatch(body: &[u8], state: &Arc<Mutex<MockState>>) -> String {
         .get("params")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    let st = state.lock().unwrap();
+    let mut st = state.lock().unwrap();
 
     match method {
         "getLatestBlockhash" => {
@@ -257,6 +264,7 @@ fn dispatch(body: &[u8], state: &Arc<Mutex<MockState>>) -> String {
             )
         }
         "sendTransaction" => {
+            st.send_count += 1;
             if let Some(msg) = &st.send_error {
                 return error_response(id, -32002, msg);
             }
