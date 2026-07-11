@@ -228,16 +228,14 @@ pub async fn build_subscription_activation_transaction_with_options(
     // The on-chain `Subscribe` instruction binds the subscriber's signature
     // to a specific `SubscriptionAuthority::init_id`. Callers must explicitly
     // initialize/read that authority before asking this pure builder to run.
-    let blockhash_str = method_details.recent_blockhash.as_deref().ok_or_else(|| {
-        Error::Other(
-            "Challenge is missing methodDetails.recentBlockhash — the server failed \
-             to pre-fetch one. Check the server's operator.rpc_url config."
-                .into(),
-        )
-    })?;
-    let blockhash: solana_hash::Hash = blockhash_str
-        .parse()
-        .map_err(|e| Error::Other(format!("Invalid recentBlockhash: {e}")))?;
+    let blockhash: solana_hash::Hash = match method_details.recent_blockhash.as_deref() {
+        Some(value) => value
+            .parse()
+            .map_err(|e| Error::Other(format!("Invalid recentBlockhash: {e}")))?,
+        None => rpc
+            .get_latest_blockhash()
+            .map_err(|e| Error::Other(format!("Failed to fetch recent blockhash: {e}")))?,
+    };
 
     let expected_subscription_authority_init_id = match options.subscription_authority_init_id {
         Some(init_id) => init_id,
@@ -932,11 +930,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn missing_recent_blockhash_errors() {
+    async fn missing_recent_blockhash_uses_client_rpc() {
         let mut md = make_method_details(false, None);
         md.recent_blockhash = None;
-        let err = build_with(&md).await.expect_err("missing recentBlockhash");
-        assert!(format!("{err}").contains("recentBlockhash"));
+        let payload = build_with(&md)
+            .await
+            .expect("client RPC blockhash fallback");
+        assert!(matches!(payload, CredentialPayload::Transaction { .. }));
     }
 
     #[tokio::test(flavor = "multi_thread")]
