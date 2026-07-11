@@ -120,10 +120,6 @@ describe('configure', () => {
             }),
         ).rejects.toThrow(/atomic shared replayStore/);
 
-        await expect(configure({ mpp: { challengeBindingSecret: 'test-secret' } })).rejects.toThrow(
-            /atomic shared replayStore/,
-        );
-
         const local = await configure(SECRET);
         expect(local.replayStore).toBeDefined();
 
@@ -146,6 +142,21 @@ describe('configure', () => {
             });
             expect(config.mpp.allowUnsafeMemoryStore).toBe(true);
             expect(config.replayStore).toBeDefined();
+        } finally {
+            delete process.env.PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE;
+        }
+    });
+
+    it('lets an explicit false override the in-memory replay-store environment opt-in', async () => {
+        process.env.PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE = '1';
+        try {
+            await expect(
+                configure({
+                    mpp: { allowUnsafeMemoryStore: false, challengeBindingSecret: 'test-secret' },
+                    network: 'solana_devnet',
+                    operator: { signer: await Signer.generate() },
+                }),
+            ).rejects.toThrow(/atomic shared replayStore/);
         } finally {
             delete process.env.PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE;
         }

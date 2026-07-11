@@ -1,5 +1,4 @@
 import { createMemorySessionStore } from '@solana/mpp/server';
-import { Store } from 'mppx';
 import { describe, expect, it, vi } from 'vitest';
 
 import { createSessionEngine } from '../adapters/mpp-session.js';
@@ -8,6 +7,7 @@ import { Gate } from '../gate.js';
 import { usd } from '../price.js';
 import { session } from '../pricing.js';
 import { Signer } from '../signer.js';
+import { createUnsafeMemorySubscriptionReplayStore } from '../subscription-replay-store.js';
 
 async function setup(
     options: {
@@ -16,6 +16,11 @@ async function setup(
     } = {},
 ) {
     const signer = await Signer.generate();
+    const replayStore = {
+        ...createUnsafeMemorySubscriptionReplayStore(),
+        isDurable: true,
+        isShared: true,
+    };
     const config = await configure({
         mpp: {
             challengeBindingSecret: 'session-store-test-secret',
@@ -23,7 +28,7 @@ async function setup(
         },
         network: options.network ?? 'solana_localnet',
         operator: { signer },
-        replayStore: Store.memory(),
+        replayStore,
     });
     const gate = Gate.create(
         {
