@@ -22,12 +22,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import fcntl
 import json
 import os
 import tempfile
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised by the platform-independent availability test
+    fcntl = None  # type: ignore[assignment]
 
 
 @runtime_checkable
@@ -91,6 +95,11 @@ class FileReplayStore:
     is_shared = True
 
     def __init__(self, path: str | os.PathLike[str]) -> None:
+        if fcntl is None:
+            raise RuntimeError(
+                "FileReplayStore requires POSIX advisory file locking; "
+                "configure a durable shared Store implementation on this platform"
+            )
         self._path = Path(path)
         self._lock_path = self._path.with_name(self._path.name + ".lock")
         self._lock = asyncio.Lock()
@@ -99,13 +108,16 @@ class FileReplayStore:
     @contextlib.contextmanager
     def _file_lock(self, *, exclusive: bool):
         """Lock all live FileReplayStore instances sharing this path."""
+        lock_api = fcntl
+        if lock_api is None:
+            raise RuntimeError("FileReplayStore cannot lock replay evidence on this platform")
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with open(self._lock_path, "a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+            lock_api.flock(handle.fileno(), lock_api.LOCK_EX if exclusive else lock_api.LOCK_SH)
             try:
                 yield
             finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                lock_api.flock(handle.fileno(), lock_api.LOCK_UN)
 
     def _load(self) -> dict[str, Any]:
         try:
