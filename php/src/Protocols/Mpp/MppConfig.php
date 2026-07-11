@@ -39,7 +39,6 @@ final readonly class MppConfig
         public int $expiresIn = 120,
         public bool $acceptPushMode = false,
         public ?Store $replayStore = null,
-        public bool $allowUnsafeMemoryStore = false,
     ) {
         if ($expiresIn < 0) {
             throw new ConfigurationException(
@@ -64,7 +63,6 @@ final readonly class MppConfig
             $this->expiresIn,
             $this->acceptPushMode,
             $this->replayStore,
-            $this->allowUnsafeMemoryStore,
         );
     }
 

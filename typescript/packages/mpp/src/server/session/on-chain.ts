@@ -464,7 +464,7 @@ export interface VerifyOpenTxExpected {
     readonly programId?: string | undefined;
     /** Primary recipient (challenge `recipient`). */
     readonly recipient: string;
-    /** Ordered payout distribution committed by the challenge. */
+    /** Exact payment-channel distribution advertised by the challenge. */
     readonly splits?: readonly { readonly bps: number; readonly recipient: string }[] | undefined;
     /** Optional explicit token program (otherwise derived from currency/network). */
     readonly tokenProgram?: string | undefined;
@@ -715,6 +715,26 @@ export async function verifyOpenTx(args: VerifyOpenTxArgs): Promise<VerifyOpenTx
     if (expected.openSlot !== undefined && openSlot !== expected.openSlot) {
         throw new Error(`verifyOpenTx: openSlot ${openSlot} != challenge-issued openSlot ${expected.openSlot}`);
     }
+    if (expected.splits !== undefined) {
+        if (recipients.length !== expected.splits.length) {
+            throw new Error(
+                `verifyOpenTx: recipient split count ${recipients.length} != expected ${expected.splits.length}`,
+            );
+        }
+        for (let index = 0; index < recipients.length; index += 1) {
+            const actual = recipients[index];
+            const expectedSplit = expected.splits[index];
+            if (
+                !actual ||
+                !expectedSplit ||
+                actual.recipient !== expectedSplit.recipient ||
+                actual.bps !== expectedSplit.bps
+            ) {
+                throw new Error(`verifyOpenTx: recipient split at index ${index} does not match the challenge`);
+            }
+        }
+    }
+
     const expectedSplits = expected.splits ?? [];
     if (recipients.length !== expectedSplits.length) {
         throw new Error(
@@ -845,12 +865,11 @@ export interface GetAccountInfoRpc {
     };
 }
 
-/** Minimal RPC shape required to bind a top-up signature to its transaction. */
 export interface TopUpTransactionRpc {
     getTransaction(
         signature: Signature,
         config: {
-            readonly commitment: 'confirmed';
+            readonly commitment?: 'confirmed';
             readonly encoding: 'base64';
             readonly maxSupportedTransactionVersion: 0;
         },
@@ -1263,6 +1282,10 @@ export async function verifySignatureOnlyOpenTransaction(args: {
     }
 }
 
+/**
+ * Confirms that a landed transaction contains exactly the required payment-channel
+ * top-up: same program, same channel account, and the precise deposit delta.
+ */
 export async function verifyTopUpTransaction(args: {
     readonly amount: bigint;
     readonly channelId: string;
@@ -1305,32 +1328,34 @@ export async function verifyTopUpTransaction(args: {
         throw new Error(`verifyTopUpTransaction: invalid transaction data: ${errorMessage(error)}`);
     }
 
-    let topUpCount = 0;
-    let topUpTotal = 0n;
     const loadedAddresses = fetched.meta?.loadedAddresses;
     const accounts = [
         ...message.staticAccounts,
         ...(loadedAddresses?.writable ?? []),
         ...(loadedAddresses?.readonly ?? []),
     ];
+    let count = 0;
+    let total = 0n;
     for (const instruction of message.instructions) {
         if (accounts[instruction.programAddressIndex] !== args.programId) continue;
         if (!instruction.data || instruction.data[0] !== TOP_UP_DISCRIMINATOR) continue;
         const channelIndex = instruction.accountIndices?.[1];
         if (channelIndex === undefined || accounts[channelIndex] !== args.channelId) continue;
         try {
-            topUpCount += 1;
-            topUpTotal += getTopUpInstructionDataDecoder().decode(instruction.data).topUpArgs.amount;
+            count += 1;
+            total += getTopUpInstructionDataDecoder().decode(instruction.data).topUpArgs.amount;
         } catch (error) {
             throw new Error(`verifyTopUpTransaction: invalid top-up instruction: ${errorMessage(error)}`);
         }
     }
-
-    if (topUpCount !== 1) {
-        throw new Error(`verifyTopUpTransaction: expected exactly one top-up, found ${topUpCount}`);
+    if (count === 0) {
+        throw new Error(`verifyTopUpTransaction: no top-up for channel ${args.channelId} found in ${args.signature}`);
     }
-    if (topUpTotal !== args.amount) {
-        throw new Error(`verifyTopUpTransaction: on-chain top-up total ${topUpTotal} != expected delta ${args.amount}`);
+    if (count !== 1) {
+        throw new Error(`verifyTopUpTransaction: expected exactly one top-up, found ${count}`);
+    }
+    if (total !== args.amount) {
+        throw new Error(`verifyTopUpTransaction: on-chain top-up total ${total} != expected delta ${args.amount}`);
     }
 }
 

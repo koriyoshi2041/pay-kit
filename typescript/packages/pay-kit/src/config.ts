@@ -5,20 +5,10 @@ import type { Store } from 'mppx';
 import { ConfigurationError, DemoSignerOnMainnetError, ProtocolNotSupportedError } from './errors.js';
 import { type Stablecoin, STABLECOINS } from './price.js';
 import { type Network, type NetworkSlug, type Protocol, toNetwork, toSolanaNetwork } from './protocol.js';
-import {
-    createMemoryReplayStore,
-    createUnsafeMemoryReplayStore,
-    isAtomicReplayStore,
-    isProductionReplayStore,
-    isReservingReplayStore,
-} from './replay-store.js';
 import { type KeychainSigner, type PayKitSigner, Signer } from './signer.js';
-import type { AtomicSubscriptionReplayStore } from './subscription-replay-store.js';
 
 /** MPP protocol options. */
 export type MppOptions = {
-    /** Explicitly permit process-local replay state for development/tests. */
-    readonly allowUnsafeMemoryStore?: boolean;
     /**
      * HMAC secret binding challenges to their contents. Resolved from
      * `PAY_KIT_MPP_SECRET` or `MPP_SECRET_KEY` when omitted; auto-generated
@@ -75,12 +65,8 @@ export type ConfigureParams = {
     readonly operator?: OperatorParams;
     /** Run boot-time safety checks. */
     readonly preflight?: boolean;
-    /**
-     * Replay-protection store. MPP validates atomic/shared capability at
-     * runtime; subscription gates additionally require the atomic
-     * {@link AtomicSubscriptionReplayStore} contract.
-     */
-    readonly replayStore?: AtomicSubscriptionReplayStore | Store.Store;
+    /** Replay-protection store. Use a persistent backend in production. */
+    readonly replayStore?: Store.Store;
     /** Defaults to the public RPC endpoint for the network. */
     readonly rpcUrl?: string;
     /** Ordered settlement preference. */
@@ -92,7 +78,6 @@ export type ConfigureParams = {
 export type PayKitConfig = {
     readonly accept: readonly Protocol[];
     readonly mpp: {
-        readonly allowUnsafeMemoryStore: boolean;
         readonly challengeBindingSecret: string;
         readonly expiresIn: number;
         readonly html: boolean;
@@ -102,7 +87,7 @@ export type PayKitConfig = {
     readonly network: Network;
     readonly operator: Operator;
     readonly preflight: boolean;
-    readonly replayStore: AtomicSubscriptionReplayStore | Store.Store | undefined;
+    readonly replayStore: Store.Store | undefined;
     readonly rpcUrl: string;
     readonly stablecoins: readonly Stablecoin[];
     readonly x402: Record<string, never>;
@@ -110,29 +95,6 @@ export type PayKitConfig = {
 
 const DEFAULT_EXPIRES_IN_SECONDS = 120;
 const ALLOW_INMEMORY_REPLAY_STORE_ENV = 'PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE';
-
-function resolveReplayStore(network: Network, provided: Store.Store | undefined, requireAtomic: boolean): Store.Store {
-    if (provided !== undefined) {
-        if (requireAtomic && !isReservingReplayStore(provided)) {
-            throw new ConfigurationError(
-                'x402 replayStore must provide an atomic reserve(key, value, ttlSeconds) operation.',
-            );
-        }
-        return provided;
-    }
-    const allowInMemory = process.env[ALLOW_INMEMORY_REPLAY_STORE_ENV] === '1';
-    if (network !== 'solana_localnet' && !allowInMemory) {
-        throw new ConfigurationError(
-            'replayStore is required outside localnet. Pass a shared persistent store with an atomic ' +
-                'reserve operation, or set PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1 to acknowledge ' +
-                'single-process replay scope.',
-        );
-    }
-    if (network !== 'solana_localnet') {
-        console.warn('[pay-kit] Using an in-memory replay store off localnet. Replay protection is process-local.');
-    }
-    return createMemoryReplayStore();
-}
 
 function resolveChallengeBindingSecret(network: Network, provided: string | undefined): string {
     const secret = provided ?? process.env.PAY_KIT_MPP_SECRET ?? process.env.MPP_SECRET_KEY;
@@ -216,48 +178,20 @@ export async function configure(params: ConfigureParams = {}): Promise<PayKitCon
         ? resolveChallengeBindingSecret(network, params.mpp?.challengeBindingSecret)
         : (params.mpp?.challengeBindingSecret ?? '');
 
-    const allowUnsafeMemoryStore =
-        params.mpp?.allowUnsafeMemoryStore ?? process.env.PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE === '1';
-    let replayStore: Store.Store | undefined = params.replayStore;
-    if (accept.includes('mpp')) {
-        if (replayStore === undefined && allowUnsafeMemoryStore) {
-            console.warn(
-                '[pay-kit] MPP explicitly enabled a process-local replay store. ' +
-                    'Replay markers are lost on restart and are not shared across workers.',
-            );
-            replayStore = createUnsafeMemoryReplayStore();
-        }
-        if (replayStore === undefined) {
-            throw new ConfigurationError(
-                'MPP requires an injected atomic shared replayStore; ' +
-                    'mpp.allowUnsafeMemoryStore or PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1 is development-only.',
-            );
-        }
-        if (!isAtomicReplayStore(replayStore) && !isReservingReplayStore(replayStore)) {
-            throw new ConfigurationError(
-                'MPP replayStore must implement atomic putIfAbsent(key, value) or reserve(key, value); ' +
-                    'legacy non-atomic stores fail closed.',
-            );
-        }
-        if (
-            !allowUnsafeMemoryStore &&
-            (!isAtomicReplayStore(replayStore) || !isProductionReplayStore(replayStore)) &&
-            (replayStore as AtomicSubscriptionReplayStore).isShared !== true &&
-            (replayStore as AtomicSubscriptionReplayStore).isDurable !== true
-        ) {
-            throw new ConfigurationError(
-                'MPP replayStore must affirmatively set isShared=true or isDurable=true; unknown stores fail closed.',
-            );
-        }
-    }
-    if (accept.includes('x402')) {
-        replayStore = resolveReplayStore(network, replayStore, true);
+    if (
+        accept.includes('mpp') &&
+        network !== 'solana_localnet' &&
+        params.replayStore === undefined &&
+        process.env[ALLOW_INMEMORY_REPLAY_STORE_ENV] !== '1'
+    ) {
+        throw new ConfigurationError(
+            `no shared replay store configured outside localnet; provide replayStore or set ${ALLOW_INMEMORY_REPLAY_STORE_ENV}=1`,
+        );
     }
 
     return Object.freeze({
         accept: Object.freeze([...accept]),
         mpp: Object.freeze({
-            allowUnsafeMemoryStore,
             challengeBindingSecret,
             expiresIn,
             html: params.mpp?.html ?? false,
@@ -267,7 +201,7 @@ export async function configure(params: ConfigureParams = {}): Promise<PayKitCon
         network,
         operator: Object.freeze(operator),
         preflight: params.preflight ?? true,
-        replayStore,
+        replayStore: params.replayStore,
         rpcUrl: params.rpcUrl ?? DEFAULT_RPC_URLS[toSolanaNetwork(network)] ?? DEFAULT_RPC_URLS.mainnet,
         stablecoins: Object.freeze([...stablecoins]),
         x402: Object.freeze({}),
@@ -279,10 +213,9 @@ export async function configure(params: ConfigureParams = {}): Promise<PayKitCon
  * variables: `NETWORK`, `RPC_URL`, `ACCEPT` and `STABLECOINS`
  * (comma-separated), `OPERATOR_KEY` (any encoding {@link Signer.env}
  * accepts), `RECIPIENT`, `FEE_PAYER`, `MPP_REALM`, `MPP_SECRET`,
- * `MPP_EXPIRES_IN`, and `PREFLIGHT`. Pass `replayStore` separately because a
- * shared store is an application object, not an environment scalar.
+ * `MPP_EXPIRES_IN`, and `PREFLIGHT`.
  */
-export async function configureFromEnv(prefix = 'PAY_KIT_', replayStore?: Store.Store): Promise<PayKitConfig> {
+export async function configureFromEnv(prefix = 'PAY_KIT_'): Promise<PayKitConfig> {
     const env = (name: string) => process.env[`${prefix}${name}`]?.trim() || undefined;
     const list = (value: string | undefined) => value?.split(',').map(entry => entry.trim()) ?? undefined;
 
@@ -301,7 +234,6 @@ export async function configureFromEnv(prefix = 'PAY_KIT_', replayStore?: Store.
             signer: await Signer.env(`${prefix}OPERATOR_KEY`),
         },
         preflight: env('PREFLIGHT') === undefined ? undefined : env('PREFLIGHT') !== 'false',
-        replayStore,
         rpcUrl: env('RPC_URL'),
     });
 }

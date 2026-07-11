@@ -19,7 +19,6 @@ use PayKit\Protocol;
 use PayKit\Protocols\Mpp\MppConfig;
 use PayKit\Signer;
 use PayKit\Store\MemoryStore;
-use PayKit\Store\DurableStore;
 use PayKit\Store\ReplayStoreCapability;
 use PayKit\Store\Store;
 use PHPUnit\Framework\TestCase;
@@ -32,25 +31,8 @@ final class RequirePaymentTest extends TestCase
     private PayKit $client;
     private Psr17Factory $factory;
 
-    public function testX402OnlyConstructionDoesNotRequireMppReplayStore(): void
-    {
-        $client = new PayKit(new Config(
-            network: Network::SolanaDevnet,
-            accept: [Protocol::X402],
-            operator: new Operator(recipient: Signer::generate()->pubkey(), signer: Signer::generate()),
-            preflight: false,
-        ));
-        $middleware = new RequirePayment($client, new Gate(amount: Price::usd('0.10')));
-        self::assertInstanceOf(RequirePayment::class, $middleware);
-    }
-
     protected function setUp(): void
     {
-        // These tests exercise middleware routing, not replay protection. The
-        // devnet config would otherwise trip the off-localnet shared-store guard
-        // when RequirePayment auto-constructs its adapters, so opt into
-        // single-process scope for the suite.
-        putenv('PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE=1');
         $this->client = new PayKit(new Config(
             network: Network::SolanaDevnet,
             operator: new Operator(recipient: Signer::generate()->pubkey(), signer: Signer::generate(), feePayer: true),
@@ -61,11 +43,6 @@ final class RequirePaymentTest extends TestCase
             ),
         ));
         $this->factory = new Psr17Factory();
-    }
-
-    protected function tearDown(): void
-    {
-        putenv('PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE');
     }
 
     private function nextHandler(): RequestHandlerInterface
@@ -195,7 +172,7 @@ final class RequirePaymentTest extends TestCase
     }
 }
 
-final class MiddlewareDurableSharedReplayStore implements Store, ReplayStoreCapability, DurableStore
+final class MiddlewareDurableSharedReplayStore implements Store, ReplayStoreCapability
 {
     private MemoryStore $store;
 
@@ -210,11 +187,6 @@ final class MiddlewareDurableSharedReplayStore implements Store, ReplayStoreCapa
     }
 
     public function providesDurableSharedReplayProtection(): bool
-    {
-        return true;
-    }
-
-    public function isDurable(): bool
     {
         return true;
     }

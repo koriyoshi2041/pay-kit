@@ -515,7 +515,7 @@ async function handleOpen(args: HandleOpenArgs): Promise<Receipt.Receipt> {
             operator: args.operator,
             programId: args.programId.toString(),
             recipient: args.recipient,
-            splits: args.splits ?? [],
+            splits: args.splits,
             tokenProgram: args.tokenProgram,
         };
 
@@ -869,9 +869,9 @@ async function handleTopUp(args: HandleTopUpArgs): Promise<Receipt.Receipt> {
     // Confirm the signature and bind the resulting account state before
     // raising the local deposit.
     if (args.rpc) {
-        const canBindTransaction = isTopUpTransactionRpc(args.rpc);
-        const canBindAccountState = isGetAccountInfoRpc(args.rpc);
-        if (!canBindTransaction && (!canBindAccountState || args.network !== 'localnet')) {
+        const hasTransactionRpc = isTopUpTransactionRpc(args.rpc);
+        const hasAccountInfoRpc = isGetAccountInfoRpc(args.rpc);
+        if (!hasTransactionRpc && !hasAccountInfoRpc) {
             throw new Error('topUp requires an rpc client with getTransaction to bind the deposit delta');
         }
         const confirmedSlot = await assertSignatureSucceeded(
@@ -879,7 +879,7 @@ async function handleTopUp(args: HandleTopUpArgs): Promise<Receipt.Receipt> {
             args.payload.signature,
             'topUp',
         );
-        if (canBindTransaction) {
+        if (hasTransactionRpc) {
             await verifyTopUpTransaction({
                 amount: newDeposit - existing.deposit,
                 channelId: args.payload.channelId,
@@ -888,7 +888,7 @@ async function handleTopUp(args: HandleTopUpArgs): Promise<Receipt.Receipt> {
                 signature: args.payload.signature as Signature,
             });
         }
-        if (!canBindAccountState) {
+        if (!hasAccountInfoRpc) {
             if (args.network !== 'localnet') {
                 throw new Error(
                     'topUp: configured rpc does not expose getAccountInfo — cannot bind the raised deposit to the on-chain Channel account',
@@ -1337,10 +1337,6 @@ async function assertSignatureSucceeded(
     return slot;
 }
 
-function isTopUpTransactionRpc(rpc: RpcLike | undefined): rpc is RpcLike & TopUpTransactionRpc {
-    return typeof (rpc as { getTransaction?: unknown } | undefined)?.getTransaction === 'function';
-}
-
 /** Throw unless the voucher's Ed25519 signature verifies against `authorizedSigner`. */
 async function assertVoucherSignature(signed: SignedVoucher, authorizedSigner: string): Promise<void> {
     let valid = false;
@@ -1366,6 +1362,10 @@ function isMultiDelegateSubmitRpc(rpc: RpcLike | undefined): rpc is MultiDelegat
         typeof candidate.sendTransaction === 'function' &&
         typeof candidate.getSignatureStatuses === 'function'
     );
+}
+
+function isTopUpTransactionRpc(rpc: RpcLike | undefined): rpc is RpcLike & TopUpTransactionRpc {
+    return typeof (rpc as { getTransaction?: unknown } | undefined)?.getTransaction === 'function';
 }
 
 function isPlaceholderSignature(signature: string | undefined): boolean {
