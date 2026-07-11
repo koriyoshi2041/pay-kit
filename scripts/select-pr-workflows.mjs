@@ -137,6 +137,7 @@ function main() {
     .map((path) => path.trim())
     .filter(Boolean);
   const selected = selectWorkflows(files);
+  const docsOnly = files.length > 0 && Object.values(selected).every((enabled) => !enabled);
   const outputIndex = process.argv.indexOf("--github-output");
 
   if (outputIndex === -1) {
@@ -151,6 +152,7 @@ function main() {
   for (const [name, enabled] of Object.entries(selected)) {
     appendFileSync(outputPath, `${name}=${enabled}\n`);
   }
+  appendFileSync(outputPath, `docs_only=${docsOnly}\n`);
   process.stdout.write(
     `selected: ${
       Object.entries(selected)
