@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from solana_pay_kit._paycore import store as store_module
 from solana_pay_kit._paycore.store import FileReplayStore, MemoryStore, Store
 
 
@@ -122,6 +123,12 @@ class TestFileReplayStore:
         assert not path.parent.exists()
         FileReplayStore(path)
         assert not path.parent.exists()
+
+    def test_requires_cross_process_file_locking(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        monkeypatch.setattr(store_module, "fcntl", None)
+
+        with pytest.raises(RuntimeError, match="requires POSIX advisory file locking"):
+            FileReplayStore(tmp_path / "replay.json")
 
     def test_corrupted_json_refuses_to_start(self, tmp_path: Path):
         # L4 lock: a corrupted on-disk store must fail closed at boot so a
