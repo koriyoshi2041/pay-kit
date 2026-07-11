@@ -14,6 +14,7 @@ async function setup() {
     const config = await configure({
         mpp: { challengeBindingSecret: 'adapter-test-secret', realm: 'Adapter test' },
         operator: { recipient: SELLER, signer: await Signer.generate() },
+        replayStore: createSharedTestReplayStore() as never,
     });
     return { adapter: createMppAdapter(config), config };
 }
