@@ -1,4 +1,4 @@
-import type { Store } from 'mppx';
+import { Errors, type Store } from 'mppx';
 
 /** Replay store capability required by x402's reserve-before-settle lifecycle. */
 export interface ReservingReplayStore extends Store.Store {
@@ -99,7 +99,7 @@ export function atomicReplayStoreView(store: ReplayStore): Store.Store {
         async put(key, value) {
             if (isConsumedReplayKey(key)) {
                 if (!(await store.putIfAbsent(key, value))) {
-                    throw new Error('MPP replay key is already reserved');
+                    throw new Errors.VerificationFailedError({ reason: 'MPP replay key is already reserved' });
                 }
                 return;
             }

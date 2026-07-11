@@ -87,6 +87,12 @@ describe('MPP replay-store adapter wiring', () => {
             captured.charge.map(store => store.put('solana-charge:consumed:signature', true)),
         );
         expect(results.map(result => result.status).sort()).toEqual(['fulfilled', 'rejected']);
+        expect(results.find(result => result.status === 'rejected')).toMatchObject({
+            reason: {
+                message: expect.stringContaining('MPP replay key is already reserved'),
+                name: 'VerificationFailedError',
+            },
+        });
     });
 
     it('forwards the atomic replay store into subscription construction', async () => {
