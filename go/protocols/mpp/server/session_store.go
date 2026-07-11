@@ -384,6 +384,13 @@ func (s *MemoryChannelStore) DeleteChannel(_ context.Context, channelID string) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.data, channelID)
+	// Intentionally keep s.locks[channelID]. A concurrent UpdateChannel may
+	// already hold (or be about to acquire) this channel's mutex; deleting it
+	// here lets the next channelLock(channelID) mint a *second* mutex for the
+	// same id, so two updaters would serialize on different locks and lose
+	// updates. The lock map is bounded by the number of distinct channel ids
+	// ever seen (one small mutex each), an acceptable cost for keeping
+	// read-modify-write atomic.
 	return nil
 }
 

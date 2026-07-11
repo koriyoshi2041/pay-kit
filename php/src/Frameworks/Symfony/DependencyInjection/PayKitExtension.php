@@ -93,7 +93,6 @@ final class PayKitExtension extends Extension implements ConfigurationInterface
             ->scalarNode('x402_facilitator_url')->defaultNull()->end()
             ->scalarNode('mpp_challenge_binding_secret')->defaultNull()->end()
             ->scalarNode('mpp_replay_store_service')->defaultNull()->end()
-            ->booleanNode('mpp_allow_unsafe_memory_store')->defaultFalse()->end()
             ->booleanNode('preflight')->defaultTrue()->end()
         ->end();
         return $tree;
@@ -151,7 +150,6 @@ final class PayKitExtension extends Extension implements ConfigurationInterface
                 challengeBindingSecret: isset($cfg['mpp_challenge_binding_secret']) && $cfg['mpp_challenge_binding_secret'] !== ''
                     ? (string) $cfg['mpp_challenge_binding_secret']
                     : null,
-                allowUnsafeMemoryStore: (bool) ($cfg['mpp_allow_unsafe_memory_store'] ?? false),
             ),
             preflight: (bool) ($cfg['preflight'] ?? true),
         );

@@ -35,6 +35,7 @@ final class RequirePaymentTest extends TestCase
     {
         $this->client = new PayKit(new Config(
             network: Network::SolanaDevnet,
+            accept: [Protocol::Mpp],
             operator: new Operator(recipient: Signer::generate()->pubkey(), signer: Signer::generate(), feePayer: true),
             preflight: false,
             mpp: new MppConfig(
