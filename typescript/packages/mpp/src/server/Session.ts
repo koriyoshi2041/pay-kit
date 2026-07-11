@@ -1,6 +1,9 @@
 import {
     type Address,
     createSolanaRpc,
+    getBase64Codec,
+    getSignatureFromTransaction,
+    getTransactionDecoder,
     isTransactionPartialSigner,
     type Signature,
     type TransactionPartialSigner,
@@ -23,21 +26,24 @@ import type {
 import { normalizeSignedVoucher, verifyVoucherSignature } from '../shared/voucher.js';
 import { createLifecycle, type Lifecycle } from './session/lifecycle.js';
 import {
+    type ConfirmSignatureOptions,
     type GetAccountInfoRpc,
     isGetAccountInfoRpc,
     isOpenTransactionRpc,
     type MultiDelegateSubmitRpc,
     type OpenTransactionRpc,
     PAYMENT_CHANNELS_PROGRAM_ID,
+    SignatureConfirmationError,
     submitInitMultiDelegateTxIfMissing,
     submitOpenTx,
-    submitSettleAndDistribute,
     type SubmitSettleAndDistributeResult,
+    submitSettleAndDistributeWithPreBroadcastPersistence,
     type TopUpTransactionRpc,
     verifyChannelAccountState,
     verifyOpenTx,
     verifySignatureOnlyOpenTransaction,
     verifyTopUpTransaction,
+    waitForSignatureConfirmation,
 } from './session/on-chain.js';
 import {
     type ChannelState,
@@ -47,11 +53,12 @@ import {
     type SessionStore,
 } from './session/store.js';
 import { verifyVoucherForChannel, type VoucherVerifyResult } from './session/voucher.js';
-import { buildAndSignWireTransaction } from './session/wire-tx.js';
+import { buildAndSignWireTransactionWithLifetime } from './session/wire-tx.js';
 
 // The Rust mirror keeps this default literal in
 // `crate::protocol::intents::session::DEFAULT_SESSION_EXPIRES_AT` (year 2100).
 const DEFAULT_DIRECTIVE_EXPIRES_AT = 4_102_444_800;
+const SETTLEMENT_CLAIM_LEASE_MS = 30_000n;
 
 // Lazily-created default store shared by `session()` and `session.routes()`
 // when both are built from the same parameters object — otherwise each call
@@ -135,6 +142,7 @@ export function session(parameters: session.Parameters) {
         minVoucherDelta,
         openTxSubmitter = 'client',
         paymentChannelPayerSigner,
+        settlementConfirmation,
         settlementWindowSeconds,
     } = parameters;
 
@@ -143,6 +151,9 @@ export function session(parameters: session.Parameters) {
     }
     if (signer && !isTransactionPartialSigner(signer)) {
         throw new Error('signer must implement signTransactions()');
+    }
+    if (signer && rpc) {
+        requireSettlementRpc(rpc);
     }
     if (paymentChannelPayerSigner && !isTransactionPartialSigner(paymentChannelPayerSigner)) {
         throw new Error('paymentChannelPayerSigner must implement signTransactions()');
@@ -190,6 +201,7 @@ export function session(parameters: session.Parameters) {
                         programId: resolvedProgramId,
                         recipient,
                         rpc,
+                        settlementConfirmation,
                         splits,
                         store,
                         tokenProgram,
@@ -356,6 +368,7 @@ export function session(parameters: session.Parameters) {
                         programId: resolvedProgramId,
                         recipient,
                         rpc,
+                        settlementConfirmation,
                         settlementWindow: settlementWindowSeconds,
                         splits,
                         store,
@@ -962,6 +975,7 @@ interface HandleCloseArgs {
     readonly programId: Address;
     readonly recipient: string;
     readonly rpc: RpcLike | undefined;
+    readonly settlementConfirmation: ConfirmSignatureOptions | undefined;
     readonly settlementWindow: bigint | undefined;
     readonly splits: readonly SessionSplit[] | undefined;
     readonly store: SessionStore;
@@ -1036,6 +1050,7 @@ async function handleClose(args: HandleCloseArgs): Promise<Receipt.Receipt> {
             programId: args.programId,
             recipient: args.recipient,
             rpc: args.rpc,
+            settlementConfirmation: args.settlementConfirmation,
             splits: args.splits,
             store: args.store,
             tokenProgram: args.tokenProgram,
@@ -1222,6 +1237,7 @@ interface CloseAndSettleArgs {
     readonly programId: Address;
     readonly recipient: string;
     readonly rpc: RpcLike;
+    readonly settlementConfirmation: ConfirmSignatureOptions | undefined;
     readonly splits: readonly SessionSplit[] | undefined;
     readonly store: SessionStore;
     readonly tokenProgram: string;
@@ -1235,68 +1251,198 @@ interface CloseAndSettleArgs {
  * Returns `undefined` when the channel cannot be settled (e.g. no
  * highest voucher recorded — nothing to settle).
  */
-async function closeAndSettleChannel(args: CloseAndSettleArgs): Promise<SubmitSettleAndDistributeResult | undefined> {
-    const state = await args.store.getChannel(args.channelId);
-    if (!state) return undefined;
-
-    // The distribute refund goes to the channel payer (the program enforces
-    // `payer == channel.payer`). It is recorded as `state.operator` at open.
-    // Never fall back to the recipient: refunding the merchant would derive the
-    // wrong refund token account and the settlement would fail on-chain.
-    if (!state.operator) {
-        throw new Error(
-            `cannot settle channel ${args.channelId}: the channel payer (refund destination) was not recorded at open`,
-        );
-    }
-
-    let voucher: { authorizedSigner: string; signed: SignedVoucher } | undefined;
-    if (state.highestVoucherSignature && state.highestVoucherExpiresAt !== undefined && state.cumulative > 0n) {
-        voucher = {
-            authorizedSigner: state.authorizedSigner,
-            signed: {
-                data: {
-                    channelId: args.channelId,
-                    cumulativeAmount: state.cumulative.toString(),
-                    expiresAt: Number(state.highestVoucherExpiresAt),
-                },
-                signature: state.highestVoucherSignature,
-            },
+async function closeAndSettleChannel(
+    args: CloseAndSettleArgs,
+): Promise<Pick<SubmitSettleAndDistributeResult, 'signature'> | undefined> {
+    requireSettlementRpc(args.rpc);
+    const claimOwner = crypto.randomUUID();
+    const claimNow = BigInt(Date.now());
+    let claimed = false;
+    const state = await args.store.updateChannel(args.channelId, current => {
+        if (!current) throw new Error(`Channel ${args.channelId} not found`);
+        if (current.sealed || current.settledSignature !== undefined) return current;
+        const hasPendingSignature = current.settlementPendingSignature !== undefined;
+        const claimIsFresh =
+            current.settling &&
+            current.settlementClaimExpiresAt !== undefined &&
+            current.settlementClaimExpiresAt > claimNow;
+        if (!hasPendingSignature && claimIsFresh) return current;
+        claimed = true;
+        return {
+            ...current,
+            settlementClaimExpiresAt: claimNow + SETTLEMENT_CLAIM_LEASE_MS,
+            settlementClaimOwner: claimOwner,
+            settling: true,
         };
+    });
+    if (!claimed) return undefined;
+
+    let pendingSignature = state.settlementPendingSignature as Signature | undefined;
+    let pendingLastValidBlockHeight = state.settlementPendingLastValidBlockHeight;
+    let pendingWire = state.settlementPendingWire;
+    try {
+        // The distribute refund goes to the channel payer (the program enforces
+        // `payer == channel.payer`). It is recorded as `state.operator` at open.
+        // Never fall back to the recipient: refunding the merchant would derive the
+        // wrong refund token account and the settlement would fail on-chain.
+        if (!state.operator) {
+            throw new Error(
+                `cannot settle channel ${args.channelId}: the channel payer (refund destination) was not recorded at open`,
+            );
+        }
+
+        if (!pendingSignature) {
+            let voucher: { authorizedSigner: string; signed: SignedVoucher } | undefined;
+            if (state.highestVoucherSignature && state.highestVoucherExpiresAt !== undefined && state.cumulative > 0n) {
+                voucher = {
+                    authorizedSigner: state.authorizedSigner,
+                    signed: {
+                        data: {
+                            channelId: args.channelId,
+                            cumulativeAmount: state.cumulative.toString(),
+                            expiresAt: Number(state.highestVoucherExpiresAt),
+                        },
+                        signature: state.highestVoucherSignature,
+                    },
+                };
+            }
+
+            const result = await submitSettleAndDistributeWithPreBroadcastPersistence(
+                {
+                    buildAndSignWireTransaction: async instructions => {
+                        const prepared = await buildAndSignWireTransactionWithLifetime(
+                            args.rpc as unknown as Parameters<typeof buildAndSignWireTransactionWithLifetime>[0],
+                            args.merchantSigner as unknown as TransactionSigner,
+                            instructions,
+                        );
+                        pendingLastValidBlockHeight = prepared.lastValidBlockHeight;
+                        return prepared.wire;
+                    },
+                    channelId: args.channelId,
+                    currency: args.currency,
+                    mint: args.mint,
+                    network: args.network,
+                    payee: args.recipient,
+                    payer: state.operator,
+
+                    programId: args.programId,
+                    // rentPayer reclaims the channel/escrow rent at distribute; it is the
+                    // operator recorded as the channel rentPayer at open (the fee payer),
+                    // not the refund payer carried in state.operator.
+                    rentPayer: args.operator,
+                    rpc: args.rpc as unknown as {
+                        sendTransaction: (wire: string, config?: unknown) => { send: () => Promise<Signature> };
+                    },
+                    signer: args.merchantSigner as unknown as TransactionSigner,
+                    splits: args.splits ?? [],
+                    tokenProgram: args.tokenProgram,
+                    voucher,
+                },
+                async prepared => {
+                    pendingSignature = prepared.signature;
+                    pendingWire = prepared.wire;
+                    if (pendingLastValidBlockHeight === undefined) {
+                        throw new Error(`Channel ${args.channelId} settlement transaction lifetime was not captured`);
+                    }
+                    await args.store.updateChannel(args.channelId, current => {
+                        if (!current) {
+                            throw new Error(`Channel ${args.channelId} disappeared before settlement broadcast`);
+                        }
+                        if (current.settlementClaimOwner !== claimOwner) {
+                            throw new Error(`Channel ${args.channelId} lost its settlement claim`);
+                        }
+                        return {
+                            ...current,
+                            settlementPendingLastValidBlockHeight: pendingLastValidBlockHeight,
+                            settlementPendingSignature: prepared.signature as unknown as string,
+                            settlementPendingWire: prepared.wire,
+                        };
+                    });
+                },
+            );
+            pendingSignature = result.signature;
+        } else if (pendingWire) {
+            const wireSignature = getSignatureFromTransaction(
+                getTransactionDecoder().decode(getBase64Codec().encode(pendingWire)),
+            );
+            if (wireSignature !== pendingSignature) {
+                throw new Error(`Channel ${args.channelId} pending settlement wire does not match its signature`);
+            }
+            try {
+                await (
+                    args.rpc as unknown as {
+                        sendTransaction: (wire: string, config?: unknown) => { send: () => Promise<Signature> };
+                    }
+                )
+                    .sendTransaction(pendingWire, { encoding: 'base64' })
+                    .send();
+            } catch {
+                // The RPC can report an error after accepting the transaction.
+                // Always reconcile the persisted signature before deciding.
+            }
+        }
+
+        await waitForSignatureConfirmation({
+            context: `settle channel ${args.channelId}`,
+            options: args.settlementConfirmation,
+            rpc: args.rpc,
+            signature: pendingSignature,
+        });
+        await args.store.updateChannel(args.channelId, current => {
+            if (!current) throw new Error(`Channel ${args.channelId} disappeared during settle`);
+            if (current.sealed && current.settledSignature === pendingSignature) return current;
+            if (current.settlementPendingSignature !== pendingSignature) {
+                throw new Error(`Channel ${args.channelId} settlement signature changed during confirmation`);
+            }
+            return {
+                ...current,
+                sealed: true,
+                settlementClaimExpiresAt: undefined,
+                settlementClaimOwner: undefined,
+                settlementPendingLastValidBlockHeight: undefined,
+                settlementPendingSignature: undefined,
+                settlementPendingWire: undefined,
+                settledSignature: pendingSignature as unknown as string,
+                settling: false,
+            };
+        });
+        return { signature: pendingSignature };
+    } catch (error) {
+        const definiteFailure = error instanceof SignatureConfirmationError && error.outcome === 'definite-failure';
+        let expired = false;
+        if (
+            error instanceof SignatureConfirmationError &&
+            error.reason === 'timeout' &&
+            pendingLastValidBlockHeight !== undefined
+        ) {
+            try {
+                const blockHeight = await args.rpc.getBlockHeight({ commitment: 'confirmed' }).send();
+                expired = BigInt(blockHeight) > pendingLastValidBlockHeight;
+            } catch {
+                // Failure to prove expiry is uncertainty; retain the outbox.
+            }
+        }
+        const retireOutbox = definiteFailure || expired;
+        await args.store.updateChannel(args.channelId, current => {
+            if (!current) throw new Error(`Channel ${args.channelId} disappeared during settle`);
+            if (current.sealed) return current;
+            if (current.settlementClaimOwner !== claimOwner) return current;
+            return {
+                ...current,
+                settlementClaimExpiresAt: undefined,
+                settlementClaimOwner: undefined,
+                ...(retireOutbox && current.settlementPendingSignature === pendingSignature
+                    ? {
+                          settlementPendingLastValidBlockHeight: undefined,
+                          settlementPendingSignature: undefined,
+                          settlementPendingWire: undefined,
+                      }
+                    : {}),
+                settling: false,
+            };
+        });
+        throw error;
     }
-
-    const result = await submitSettleAndDistribute({
-        buildAndSignWireTransaction: instructions =>
-            buildAndSignWireTransaction(
-                args.rpc as unknown as Parameters<typeof buildAndSignWireTransaction>[0],
-                args.merchantSigner as unknown as TransactionSigner,
-                instructions,
-            ),
-        channelId: args.channelId,
-        currency: args.currency,
-        mint: args.mint,
-        network: args.network,
-        payee: args.recipient,
-        payer: state.operator,
-
-        programId: args.programId,
-        // rentPayer reclaims the channel/escrow rent at distribute; it is the
-        // operator recorded as the channel rentPayer at open (the fee payer),
-        // not the refund payer carried in state.operator.
-        rentPayer: args.operator,
-        rpc: args.rpc as unknown as {
-            sendTransaction: (wire: string, config?: unknown) => { send: () => Promise<Signature> };
-        },
-        signer: args.merchantSigner as unknown as TransactionSigner,
-        splits: args.splits ?? [],
-        tokenProgram: args.tokenProgram,
-        voucher,
-    });
-
-    await args.store.updateChannel(args.channelId, current => {
-        if (!current) throw new Error(`Channel ${args.channelId} disappeared during settle`);
-        return { ...current, sealed: true, settledSignature: result.signature as unknown as string };
-    });
-    return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1368,6 +1514,12 @@ function isTopUpTransactionRpc(rpc: RpcLike | undefined): rpc is RpcLike & TopUp
     return typeof (rpc as { getTransaction?: unknown } | undefined)?.getTransaction === 'function';
 }
 
+function requireSettlementRpc(rpc: RpcLike): asserts rpc is SettlementRpc {
+    if (typeof (rpc as { getBlockHeight?: unknown }).getBlockHeight !== 'function') {
+        throw new Error('session settlement requires rpc.getBlockHeight() for outbox expiry recovery');
+    }
+}
+
 function isPlaceholderSignature(signature: string | undefined): boolean {
     return !signature || /^1+$/.test(signature);
 }
@@ -1431,6 +1583,13 @@ export type VerifyOpenRpc = {
 /** Minimal RPC subset used to verify and submit open transactions. */
 export type SubmitOpenRpc = VerifyOpenRpc & {
     sendTransaction(wire: string, config?: unknown): { send(): Promise<Signature> };
+};
+
+/** RPC contract required before a session settlement outbox may be created. */
+export type SettlementRpc = RpcLike & {
+    getBlockHeight(config?: { commitment?: 'confirmed' | 'finalized' | 'processed' }): {
+        send(): Promise<bigint | number>;
+    };
 };
 
 type CredentialPayload = {
@@ -1517,6 +1676,8 @@ export declare namespace session {
         readonly rpc?: RpcLike;
         /** RPC URL for blockhash prefetch. Defaults from `network`. */
         readonly rpcUrl?: string;
+        /** Settlement confirmation timing and cancellation overrides. */
+        readonly settlementConfirmation?: ConfirmSignatureOptions;
         /**
          * Settlement window in seconds — the forced-close grace period a
          * non-zero voucher `expiresAt` must outlast. When set, a voucher

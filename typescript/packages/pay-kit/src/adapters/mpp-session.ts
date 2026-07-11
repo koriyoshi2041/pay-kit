@@ -21,10 +21,6 @@ import { ConfigurationError } from '../errors.js';
 import type { Gate } from '../gate.js';
 import { toSolanaNetwork } from '../protocol.js';
 
-type SessionStoreCapability = {
-    readonly sessionStoreDurability?: 'durable-shared' | 'ephemeral';
-};
-
 /** Outcome of running the session method on the gated route. */
 export type SessionResult =
     | { readonly challenge: Response; readonly status: 402 }
@@ -71,14 +67,8 @@ export function createSessionEngine(config: PayKitConfig, gate: Gate): SessionEn
 
     const signer = config.operator.signer.signer;
     const store = resolveSessionStore(config);
-    if (
-        config.network !== 'solana_localnet' &&
-        (store as SessionStoreCapability & typeof store).sessionStoreDurability !== 'durable-shared'
-    ) {
-        throw new ConfigurationError(
-            `Gate "${gate.name}": session store must explicitly declare durable shared capability outside localnet.`,
-        );
-    }
+    const allowUnsafeEphemeralStoreOffLocalnet =
+        config.network !== 'solana_localnet' && process.env.PAY_KIT_ALLOW_INMEMORY_REPLAY_STORE === '1';
     const params = {
         cap: gate.amount.baseUnits(),
         ...(gate.session.closeDelayMs !== undefined ? { closeDelayMs: gate.session.closeDelayMs } : {}),
@@ -96,6 +86,7 @@ export function createSessionEngine(config: PayKitConfig, gate: Gate): SessionEn
         rpcUrl: config.rpcUrl,
         signer,
         store,
+        ...(allowUnsafeEphemeralStoreOffLocalnet ? { allowUnsafeEphemeralStoreOffLocalnet: true } : {}),
     };
 
     const mppx = Mppx.create({
