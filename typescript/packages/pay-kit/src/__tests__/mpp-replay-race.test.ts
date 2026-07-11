@@ -2,6 +2,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const captured = vi.hoisted(() => ({ charge: [] as any[], subscription: [] as any[] }));
 
+vi.mock('@solana/mpp', async importOriginal => ({
+    ...(await importOriginal<typeof import('@solana/mpp')>()),
+    guardChallengeValue: (_field: string, value: string) => value,
+}));
+
 vi.mock('@solana/mpp/server', () => ({
     Mppx: {
         create: () => ({
